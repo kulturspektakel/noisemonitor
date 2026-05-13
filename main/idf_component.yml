@@ -1,0 +1,6 @@
+## IDF Component Manager Manifest File
+dependencies:
+  joltwallet/littlefs: "==1.9.2"
+  espressif/esp-dsp: "^1.5.0"
+  idf:
+    version: ">=5.4.0"

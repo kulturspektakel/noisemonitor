@@ -1,0 +1,87 @@
+# Festival Noise Monitor — ESP32-S3, 16 MB flash, custom partition table.
+#
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+CONFIG_EFUSE_CUSTOM_TABLE=y
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=6096
+# https://github.com/espressif/esp-idf/issues/8710#issuecomment-1277047596
+CONFIG_MBEDTLS_HARDWARE_MPI=n
+
+# CPU at 160 MHz (DSP fits comfortably; saves ~25 mA continuous vs 240 MHz default — spec §12)
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
+
+# Build with -O2 for the DSP hot loops (spec §13)
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# Bluetooth: NimBLE peripheral only.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_CONTROLLER_BLE_ONLY=y
+CONFIG_BT_CONTROLLER_MODE_BLE_ONLY=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# BLE max concurrent activities. Default 6, each activity = 828 bytes.
+# We need 2: one for advertising, one for the incoming client connection.
+# (At 1 the controller returned HCI 0x07 "Memory Capacity Exceeded" on
+# ble_gap_adv_start because no slot remained for the eventual connection.)
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+# NimBLE host mbuf pools (MSYS_1/MSYS_2). Defaults are sized for general use
+# (write-long, multi-connection GATT). Our characteristics are 1–3 bytes and
+# we accept exactly 1 client; halving both is safe.
+#  MSYS_1: 12 × 256 B = 3 KB  →  6 × 256 B = 1.5 KB (-1.5 KB)
+#  MSYS_2: 24 × 320 B = 7.7 KB →  12 × 320 B = 3.8 KB (-3.8 KB)
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# ACL data buffer pool: default 24 × 255 B = ~7 KB single contiguous alloc.
+# Our workload is 1 Hz notifications of 1–3 byte payloads, never bursting.
+# 4 buffers is plenty.
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4
+# We don't pair/bond.
+CONFIG_BT_NIMBLE_MAX_BONDS=0
+# NimBLE host task stack: our GAP/GATT callbacks are simple. 3 KB suffices.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=3072
+
+# Stop the WiFi driver from writing NVS after a station connection. The post-
+# connect NVS commit briefly disables dcache, and mbedtls handshake code
+# reading EC curve / X.509 OID tables from flash-mapped .rodata on the other
+# core panics during the disabled window. Trade-off: WiFi reconnect can't use
+# cached AP info (~1 s slower).
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# Also stop PHY calibration data from being cached to NVS. The runtime NVS
+# write that happens when the BLE radio activates for the first scan opens
+# the same kind of cache-disable window. Trade-off: full PHY calibration
+# runs every boot (~tens of ms slower boot).
+CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n
+
+# Belt-and-braces against any remaining flash-write-triggers we haven't
+# tracked down. AUTO_SUSPEND keeps cache live during writes when the flash
+# chip supports it. EXTRA_IRAM_OPT places ppProcTxDone and friends in IRAM
+# so they keep running even if cache does briefly disable.
+CONFIG_SPI_FLASH_AUTO_SUSPEND=y
+CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
+
+# Memory tuning: the 4096-pt FFT consumes ~128 KB of static + heap. The
+# defaults for WiFi/LWIP/NimBLE assume a less memory-constrained app, so
+# trim them to our actual workload: 1 Hz MQTT publish, occasional HTTPS
+# upload, 1 BLE client. Frees enough heap that WiFi + BLE init succeed
+# without malloc fails after the FFT table is allocated.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+# mbedtls SSL session buffers. Defaults are 16384 each (32 KB total per
+# connection) which can't be allocated contiguously in our post-BLE heap
+# (MBEDTLS_ERR_SSL_ALLOC_FAILED). MQTT publishes are 1–2 KB; HTTPS log
+# uploads are ~15 KB; 4096 is plenty for both with a margin.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096

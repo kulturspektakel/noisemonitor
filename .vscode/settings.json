@@ -1,0 +1,37 @@
+{
+  "clangd.enable": false,
+  "cmake.configureOnOpen": false,
+  "cmake.automaticReconfigure": false,
+  "cmake.cmakePath": "cmake",
+  "C_Cpp.intelliSenseEngine": "default",
+  "C_Cpp.enhancedColorization": "enabled",
+  "C_Cpp.formatting": "clangFormat",
+  "[c]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true
+  },
+  "[cpp]": {
+    "editor.defaultFormatter": "ms-vscode.cpptools",
+    "editor.formatOnSave": true
+  },
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.flashType": "UART",
+  // Paths from ~/.espressif/tools/eim_idf.json. The extension wasn't auto-
+  // resolving these from EIM, so they're set explicitly at workspace scope.
+  "idf.espIdfPath": "/Users/danielbuechele/.espressif/v5.4.4/esp-idf",
+  "idf.toolsPath": "/Users/danielbuechele/.espressif/tools",
+  "idf.pythonInstallPath": "/Users/danielbuechele/.espressif/tools/python/v5.4.4/venv/bin/python",
+  // CMake isn't in ~/.espressif/tools/ (it's only ninja); add Homebrew's bin
+  // to the extension's PATH so cmake is found when it spawns the build.
+  "idf.customExtraPaths": "/opt/homebrew/bin",
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "files.associations": {
+    "*.h": "c"
+  },
+  "idf.port": "/dev/tty.usbmodem201301",
+  "idf.currentSetup": "/Users/danielbuechele/.espressif/v5.4.4/esp-idf"
+}

@@ -1,0 +1,2 @@
+Record.bands                          max_size:31, fixed_length:true
+NoiseRecording.records                max_count:60

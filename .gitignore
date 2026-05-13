@@ -1,0 +1,8 @@
+build
+sdkconfig
+sdkconfig.old
+.DS_Store
+/managed_components
+/nvs_data.csv
+/.cache
+.claude
