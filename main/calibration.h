@@ -14,7 +14,3 @@ esp_err_t calibration_clear(void);
 
 // Returns the current offset in dB (0.0 while uncalibrated).
 float calibration_offset_db(void);
-
-// Returns the persisted x100 value (record_writer/MQTT need this for the
-// noise_recording.calibration_offset_db_x100 field).
-int32_t calibration_offset_x100(void);

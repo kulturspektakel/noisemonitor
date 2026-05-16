@@ -64,8 +64,22 @@ static log_uploader_event_t upload_file(char* filename) {
   }
   fseek(f, 0, SEEK_SET);
   char* buffer = pvPortMalloc(file_size);
-  fread(buffer, file_size, 1, f);
+  if (buffer == NULL) {
+    ESP_LOGW(LOG_UPLOADER_TASK,
+             "out of heap allocating %d bytes for %s; will retry later",
+             file_size, filename);
+    fclose(f);
+    return HTTP_ISSUE;
+  }
+  size_t n = fread(buffer, 1, (size_t)file_size, f);
   fclose(f);
+  if (n != (size_t)file_size) {
+    ESP_LOGW(LOG_UPLOADER_TASK,
+             "short read on %s (got %zu of %d); will retry later",
+             filename, n, file_size);
+    vPortFree(buffer);
+    return HTTP_ISSUE;
+  }
 
   esp_http_client_handle_t client = esp_http_client_init(&config);
   http_auth_headers(client);
@@ -150,8 +164,8 @@ void log_uploader(void* params) {
         continue;
       }
 
-      char filename[29];
-      sprintf(filename, "%s/%.12s", LOG_DIR, entry->d_name);
+      char filename[320];
+      snprintf(filename, sizeof(filename), "%s/%s", LOG_DIR, entry->d_name);
       ESP_LOGI(LOG_UPLOADER_TASK, "Found log file %s", filename);
       xSemaphoreTake(network_request, portMAX_DELAY);
       log_uploader_event_t status = upload_file(filename);

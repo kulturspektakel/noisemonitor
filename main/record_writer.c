@@ -5,7 +5,6 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "audio_dsp.h"
-#include "calibration.h"
 #include "constants.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
@@ -17,21 +16,17 @@
 #include "power_management.h"
 
 #define HEADROOM_BYTES (200 * 1024)
-// 60 records → ~1 minute per file → ~3.5 KB LogMessage staging buffer.
-// Was 300 (5 min, ~17 KB); the larger struct couldn't be heap-allocated
-// after WiFi + BLE + MQTT had fragmented the heap. The 200 KB partition
-// headroom check still gates ring-buffer eviction the same way; we just
-// rotate files 5× more often.
-#define RECORDS_PER_FILE 60
+// 300 records → ~5 minutes per file.
+#define RECORDS_PER_FILE 300
 
 static const char* TAG = "record_writer";
 static const char* ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-// Heap-allocated lazily on first record arrival (see record_writer task body).
-// The struct is ~16 KB and was previously static .bss — moving it to heap
-// frees that DRAM at boot so BLE controller init has room. Allocated once,
-// never freed — same fragmentation profile as static (spec §7 intent).
-static LogMessage* log_message_buf = NULL;
+// Static BSS allocation (~13 KB at 300 records). Keeps this big buffer out
+// of the heap pool entirely — no fragmentation contribution, no risk of
+// failed lazy alloc after WiFi/BLE init. Zero-initialized at boot; fields
+// are explicitly rewritten in flush_to_file() on every batch.
+static LogMessage log_message_buf;
 static int records_count = 0;
 
 static bool write_pb_to_file(pb_ostream_t* stream, const uint8_t* buffer, size_t count) {
@@ -100,28 +95,19 @@ static void generate_client_id(char* dst, size_t dst_size) {
   dst[n] = '\0';
 }
 
-static void copy_record(Record* dst, const record_t* src) {
-  dst->seq_no = src->seq_no;
-  memcpy(dst->bands, src->bands, sizeof(src->bands));
-  dst->laeq_1s   = src->laeq_1s;
-  dst->lceq_1s   = src->lceq_1s;
-  dst->lafmax_1s = src->lafmax_1s;
-  dst->lcfmax_1s = src->lcfmax_1s;
-  dst->lcpeak_1s = src->lcpeak_1s;
-}
-
 static void flush_to_file(void) {
-  strlcpy(log_message_buf->device_id, DEVICE_ID, sizeof(log_message_buf->device_id));
-  generate_client_id(log_message_buf->client_id, sizeof(log_message_buf->client_id));
-  log_message_buf->device_time = (int32_t)time(NULL);
-  log_message_buf->device_time_is_utc = true;
-  log_message_buf->has_battery_voltage = true;
-  log_message_buf->battery_voltage = battery_voltage;
-  log_message_buf->has_usb_voltage = true;
-  log_message_buf->usb_voltage = usb_voltage;
-  log_message_buf->has_noise_recording = true;
-  log_message_buf->noise_recording.calibration_offset_db_x100 = calibration_offset_x100();
-  log_message_buf->noise_recording.records_count = records_count;
+  strlcpy(log_message_buf.device_id, DEVICE_ID, sizeof(log_message_buf.device_id));
+  generate_client_id(log_message_buf.client_id, sizeof(log_message_buf.client_id));
+  log_message_buf.device_time = (int32_t)time(NULL);
+  log_message_buf.device_time_is_utc = true;
+  log_message_buf.has_battery_voltage = true;
+  log_message_buf.battery_voltage = battery_voltage;
+  log_message_buf.has_usb_voltage = true;
+  log_message_buf.usb_voltage = usb_voltage;
+  log_message_buf.has_noise_recording = true;
+  log_message_buf.noise_recording.records_count = records_count;
+  log_message_buf.noise_recording.laeq_15m = audio_dsp_get_laeq_15m(NULL);
+  log_message_buf.noise_recording.lceq_15m = audio_dsp_get_lceq_15m(NULL);
 
   ensure_free_space();
 
@@ -131,8 +117,8 @@ static void flush_to_file(void) {
       sizeof(filename),
       "%s/%010ld_%s.log",
       LOG_DIR,
-      (long)log_message_buf->device_time,
-      log_message_buf->client_id
+      (long)log_message_buf.device_time,
+      log_message_buf.client_id
   );
   ESP_LOGI(TAG, "Writing log file %s (%d records)", filename, records_count);
 
@@ -150,7 +136,7 @@ static void flush_to_file(void) {
       .bytes_written = 0,
   };
 
-  if (!pb_encode(&stream, LogMessage_fields, log_message_buf)) {
+  if (!pb_encode(&stream, LogMessage_fields, &log_message_buf)) {
     ESP_LOGE(TAG, "Failed to encode log: %s", stream.errmsg);
   }
   fclose(file);
@@ -167,23 +153,7 @@ void record_writer(void* params) {
     record_t r;
     if (xQueueReceive(record_writer_queue, &r, portMAX_DELAY) != pdTRUE) continue;
 
-    // First-record-arrived path: do the one-time heap alloc of the LogMessage
-    // staging buffer. By now WiFi/BLE init are long done — this avoids tying
-    // up ~16 KB of DRAM at boot when the controllers most need contiguous
-    // memory.
-    if (log_message_buf == NULL) {
-      log_message_buf = calloc(1, sizeof(LogMessage));
-      if (log_message_buf == NULL) {
-        ESP_LOGE(TAG, "failed to allocate LogMessage buffer (%u bytes); dropping records",
-                 (unsigned)sizeof(LogMessage));
-        // Drain queue forever to keep DSP non-blocking sends successful.
-        continue;
-      }
-      ESP_LOGI(TAG, "LogMessage staging buffer allocated (%u bytes)",
-               (unsigned)sizeof(LogMessage));
-    }
-
-    copy_record(&log_message_buf->noise_recording.records[records_count], &r);
+    record_to_pb(&r, &log_message_buf.noise_recording.records[records_count]);
     records_count++;
     if (records_count >= RECORDS_PER_FILE) {
       flush_to_file();

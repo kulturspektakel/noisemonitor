@@ -81,12 +81,12 @@ static void event_handler(
   } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     ESP_LOGI(WIFI_CONNECT_TASK, "WiFi connected");
     wifi_status = CONNECTED;
-    // Spec §12 wanted modem-sleep (WIFI_PS_MIN_MODEM) for ~50 mA savings,
-    // but on the iPhone Personal Hotspot we used for development the hotspot
-    // drops idle clients after ~10 s if our radio is dozing. Keeping the
-    // radio fully awake (WIFI_PS_NONE) is the workaround. Revisit when
-    // running against a real router on battery.
-    esp_wifi_set_ps(WIFI_PS_NONE);
+    // Modem-sleep (WIFI_PS_MIN_MODEM) per spec §12 — large WiFi power saving
+    // when idle. Past concern: iPhone Personal Hotspot used in development
+    // drops idle clients after ~10 s when our radio is dozing. If reconnect
+    // churn returns, fall back to WIFI_PS_NONE (we publish to MQTT every 1 s
+    // anyway, so true idle is rare on a real router).
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
     update_signal_strength();
     xEventGroupSetBits(event_group, WIFI_CONNECTED);
     xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eNoAction);

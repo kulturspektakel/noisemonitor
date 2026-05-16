@@ -1,2 +1,10 @@
-Record.bands                          max_size:31, fixed_length:true
-NoiseRecording.records                max_count:60
+NoiseRecording.Record.bands           max_size:31, fixed_length:true
+NoiseRecording.Record.laeq_1s         int_size:IS_8
+NoiseRecording.Record.lceq_1s         int_size:IS_8
+NoiseRecording.Record.lafmax_1s       int_size:IS_8
+NoiseRecording.Record.lcfmax_1s       int_size:IS_8
+NoiseRecording.Record.lcpeak_1s       int_size:IS_8
+NoiseRecording.records                max_count:300
+NoiseRecording.laeq_15m               int_size:IS_8
+NoiseRecording.lceq_15m               int_size:IS_8
+NoiseRecording.battery_mv             int_size:IS_16

@@ -14,21 +14,24 @@
 
 #include "esp_heap_caps.h"
 #include "heap_diag.h"
+#include "nanopb/pb_encode.h"
+#include "power_management.h"
 
 static const char* TAG = "audio_dsp";
 
-// --- Temporary: synthesize audio in software (no mic hardware yet) -----------
-// Set to 1 to bypass the I²S peripheral and inject a 1 kHz sine wave with a
-// little broadband noise on top. The rest of the DSP pipeline behaves exactly
-// as if real audio were arriving. Flip back to 0 once the ICS-43434 is wired.
-#define SIMULATE_MIC 1
+// --- Optional: synthesize audio in software ---------------------------------
+// Set to 1 to bypass the mic and inject a synthetic signal through the DSP
+// pipeline (useful for testing the rest of the chain without a working mic).
+#define SIMULATE_MIC 0
 
 // --- I²S configuration --------------------------------------------------------
+// INMP441: standard I²S mic, 24-bit signed samples left-aligned in a 32-bit slot.
+// Tie L/R pin to GND for left channel (matches I2S_STD_SLOT_LEFT below).
 #define SAMPLE_RATE      48000
-#define I2S_BCLK_GPIO    GPIO_NUM_9
-#define I2S_WS_GPIO      GPIO_NUM_10
-#define I2S_DATA_GPIO    GPIO_NUM_11
-#define I2S_BUFFER_FRAMES 1024   // per i2s_channel_read call
+#define I2S_BCLK_GPIO    GPIO_NUM_11   // SCK on the mic
+#define I2S_WS_GPIO      GPIO_NUM_9    // WS on the mic
+#define I2S_DATA_GPIO    GPIO_NUM_12   // SD on the mic
+#define I2S_BUFFER_FRAMES 1024         // per i2s_channel_read call
 
 // --- FFT configuration --------------------------------------------------------
 // Spec §13 prefers radix-4 FFT, but on this no-PSRAM ESP32-S3 the radix-4
@@ -40,10 +43,8 @@ static const char* TAG = "audio_dsp";
 #define FFT_SIZE 4096
 #define FFT_HOP  2048     // 50% overlap
 
-// --- Aggregate ring sizes (spec §9) -------------------------------------------
-#define RING_1M  60
+// --- Aggregate ring size — only 15-min sliding LAeq/LCeq are exposed ---------
 #define RING_15M 900
-#define RING_30M 1800
 
 // --- Center frequencies (Hz) per band, spec §5 --------------------------------
 static const float band_centers[NOISE_BANDS] = {
@@ -53,19 +54,8 @@ static const float band_centers[NOISE_BANDS] = {
     16000
 };
 
-// --- A/C-weighting tables per band, spec Appendix -----------------------------
-static const float a_weight_db[NOISE_BANDS] = {
-  -56.7f, -50.5f, -44.7f, -39.4f, -34.6f, -30.2f, -26.2f, -22.5f, -19.1f, -16.1f,
-  -13.4f, -10.9f,  -8.6f,  -6.6f,  -4.8f,  -3.2f,  -1.9f,  -0.8f,   0.0f,  +0.6f,
-   +1.0f,  +1.2f,  +1.3f,  +1.2f,  +1.0f,  +0.5f,  -0.1f,  -1.1f,  -2.5f,  -4.3f,
-   -6.6f
-};
-static const float c_weight_db[NOISE_BANDS] = {
-   -8.5f, -6.2f, -4.4f, -3.0f, -2.0f, -1.3f, -0.8f, -0.5f, -0.3f, -0.2f,
-   -0.1f,  0.0f,  0.0f,  0.0f,  0.0f,  0.0f,  0.0f,  0.0f,  0.0f,  0.0f,
-   -0.1f, -0.2f, -0.3f, -0.5f, -0.8f, -1.3f, -2.0f, -3.0f, -4.4f, -6.2f,
-   -8.5f
-};
+// A/C-weighting now applied per FFT bin (see compute_bin_weights) using the
+// IEC 61672 analog filter formulas; the band-table approximation was removed.
 
 // --- Queues (extern) ---------------------------------------------------------
 QueueHandle_t record_writer_queue;
@@ -80,37 +70,39 @@ static float    fft_ring[FFT_SIZE];                // last FFT_SIZE float sample
 static int      fft_ring_head = 0;                 // next write index
 static int      samples_since_last_fft = 0;        // hop counter
 
-static float    hann_window[FFT_SIZE];
 static float    fft_work[FFT_SIZE * 2];            // complex pairs for FFT in/out
 // Twiddle-factor table for dsps_fft2r_init_fc32 (16 KB at FFT_SIZE=4096).
 // Heap-allocated in audio_dsp_preinit() (called from app_main).
 static float*   fft_table = NULL;
 static int      band_start_bin[NOISE_BANDS + 1];   // inclusive start; one extra = exclusive end of last band
 
+// Per-bin A and C weighting (linear power factors), populated at init from
+// IEC 61672 formulas. 8 KB each, BSS. Avoid the band-center approximation
+// for LAeq/LCeq — apply weighting at each bin's exact frequency instead.
+static float    a_weight_bin[FFT_SIZE / 2];
+static float    c_weight_bin[FFT_SIZE / 2];
+
 // Per-second energy accumulators
 static double   band_energy_sum[NOISE_BANDS];
+static double   a_weighted_sum_per_sec = 0.0;
+static double   c_weighted_sum_per_sec = 0.0;
+// Max-per-second of single-FFT A/C weighted energy. Each FFT covers 85 ms of
+// audio (≈ Fast time-weighting's 125 ms response window), so the loudest FFT
+// in a second is a reasonable proxy for LAFmax/LCFmax without a per-sample
+// IIR biquad cascade.
+static double   a_weighted_max_per_fft = 0.0;
+static double   c_weighted_max_per_fft = 0.0;
 static int      fft_windows_in_second = 0;
 static int      broadband_samples_in_second = 0;
 static float    peak_abs_sample_in_second = 0.0f;
 
-// Aggregate ring buffers (linear energies, not dB)
-static float    laeq_ring_1m[RING_1M];
+// 15-min sliding LAeq/LCeq ring buffers (linear energies, not dB).
 static float    laeq_ring_15m[RING_15M];
-static float    laeq_ring_30m[RING_30M];
-static float    lceq_ring_1m[RING_1M];
 static float    lceq_ring_15m[RING_15M];
-static float    lafmax_ring_1m[RING_1M];
-static float    lcpeak_ring_1m[RING_1M];
-static int      ring_idx_1m = 0;
 static int      ring_idx_15m = 0;
-static int      ring_idx_30m = 0;
 static int      total_seconds = 0;
 
 static uint32_t seq_no = 0;
-
-// Forward refs
-static uint8_t encode_db_to_byte(float db);
-static float   decode_byte_to_db(uint8_t b);
 
 #if SIMULATE_MIC
 // Four tones at frequencies spread across the 1/3-octave bands, each with its
@@ -118,7 +110,7 @@ static float   decode_byte_to_db(uint8_t b);
 // composite spectrum shifts continuously — LAeq swings ~15 dB over time and
 // different band[] cells light up at different moments. Plus a white-noise
 // floor that contributes broadband content to every band.
-// Replace with real I²S (SIMULATE_MIC=0) once an ICS-43434 is wired.
+// Replace with real I²S (SIMULATE_MIC=0) once the INMP441 is wired.
 #define SIM_TONE_COUNT 4
 static const float sim_tone_freq[SIM_TONE_COUNT]    = {  80.0f, 500.0f, 2000.0f, 8000.0f };
 static const float sim_tone_amp[SIM_TONE_COUNT]     = {   0.10f,  0.08f,   0.06f,   0.04f };
@@ -156,6 +148,11 @@ static void fill_simulated_buffer(int32_t* dst, int n) {
 // --- Init helpers -----------------------------------------------------------
 static void i2s_init(void) {
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  // Halve the DMA buffer pool vs defaults (6×240 frames → 4×120). Saves ~4 KB
+  // of contiguous heap during audio_dsp init. With 120 frames @ 48 kHz the
+  // DMA window is 2.5 ms — well under our 21 ms i2s_channel_read cadence.
+  chan_cfg.dma_desc_num  = 4;
+  chan_cfg.dma_frame_num = 120;
   ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &i2s_rx));
 
   i2s_std_config_t std_cfg = {
@@ -170,7 +167,7 @@ static void i2s_init(void) {
           .invert_flags = { 0 },
       },
   };
-  // ICS-43434 SEL is tied to GND => sends data on the LEFT channel.
+  // INMP441 L/R tied to GND => mic transmits on the LEFT channel.
   std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_rx, &std_cfg));
   ESP_ERROR_CHECK(i2s_channel_enable(i2s_rx));
@@ -192,6 +189,47 @@ static void compute_band_edges(void) {
   int top_bin = (int)(top_upper / bin_hz + 0.5f);
   if (top_bin > FFT_SIZE / 2) top_bin = FFT_SIZE / 2;
   band_start_bin[NOISE_BANDS] = top_bin;
+}
+
+// Populate a_weight_bin[] and c_weight_bin[] with linear power weights
+// (10^(weight_dB/10)) per FFT bin, using IEC 61672 analog filter formulas.
+// Normalized so weight at 1 kHz = 1.0 (= 0 dB), matching standard A/C weighting.
+static void compute_bin_weights(void) {
+  const double bin_hz = (double)SAMPLE_RATE / (double)FFT_SIZE;
+  // IEC 61672 pole frequencies (Hz)
+  const double f1_sq = 20.598997   * 20.598997;
+  const double f2_sq = 107.65265   * 107.65265;
+  const double f3_sq = 737.86223   * 737.86223;
+  const double f4_sq = 12194.217   * 12194.217;
+
+  // R(1000)^2 for A and C — used to normalize so weight at 1 kHz is unity.
+  double ra1000_sq, rc1000_sq;
+  {
+    double f_sq = 1000.0 * 1000.0;
+    double t1 = f_sq + f1_sq;
+    double t2 = f_sq + f2_sq;
+    double t3 = f_sq + f3_sq;
+    double t4 = f_sq + f4_sq;
+    double ra = (f4_sq * f_sq * f_sq) / (t1 * sqrt(t2 * t3) * t4);
+    double rc = (f4_sq * f_sq)        / (t1 * t4);
+    ra1000_sq = ra * ra;
+    rc1000_sq = rc * rc;
+  }
+
+  a_weight_bin[0] = 0.0f;  // DC bin is excluded from sums
+  c_weight_bin[0] = 0.0f;
+  for (int k = 1; k < FFT_SIZE / 2; k++) {
+    double f = (double)k * bin_hz;
+    double f_sq = f * f;
+    double t1 = f_sq + f1_sq;
+    double t2 = f_sq + f2_sq;
+    double t3 = f_sq + f3_sq;
+    double t4 = f_sq + f4_sq;
+    double ra = (f4_sq * f_sq * f_sq) / (t1 * sqrt(t2 * t3) * t4);
+    double rc = (f4_sq * f_sq)        / (t1 * t4);
+    a_weight_bin[k] = (float)((ra * ra) / ra1000_sq);
+    c_weight_bin[k] = (float)((rc * rc) / rc1000_sq);
+  }
 }
 
 esp_err_t audio_dsp_preinit(void) {
@@ -220,8 +258,8 @@ static void dsp_init(void) {
     ESP_LOGE(TAG, "dsps_fft2r_init_fc32 failed: 0x%x", err);
     ESP_ERROR_CHECK(err);
   }
-  dsps_wind_hann_f32(hann_window, FFT_SIZE);
   compute_band_edges();
+  compute_bin_weights();
 }
 
 // --- Conversion helpers -----------------------------------------------------
@@ -232,28 +270,32 @@ static uint8_t encode_db_to_byte(float db) {
   if (v > 255.0f) return 255;
   return (uint8_t)(v + 0.5f);
 }
-static float decode_byte_to_db(uint8_t b) {
-  return 20.0f + b / 2.0f;
-}
 
 // --- FFT execution: pulls FFT_SIZE samples from fft_ring (oldest-first) ----
 static void run_fft_and_accumulate(void) {
-  // Copy fft_ring into fft_work as complex pairs (real, 0), applying Hann.
+  // Copy fft_ring into fft_work as complex pairs (real, 0), applying Hann on
+  // the fly (saves 16 KB vs. a precomputed table; ~9 ms/sec of cosf calls).
   // fft_ring is circular; oldest sample is at fft_ring_head.
+  const float hann_k = 2.0f * (float)M_PI / (float)FFT_SIZE;
   for (int i = 0; i < FFT_SIZE; i++) {
     int idx = (fft_ring_head + i) % FFT_SIZE;
-    fft_work[2 * i]     = fft_ring[idx] * hann_window[i];
+    float h = 0.5f * (1.0f - cosf((float)i * hann_k));
+    fft_work[2 * i]     = fft_ring[idx] * h;
     fft_work[2 * i + 1] = 0.0f;
   }
 
-  dsps_fft2r_fc32(fft_work, FFT_SIZE);
-  dsps_bit_rev2r_fc32(fft_work, FFT_SIZE);
+  // ANSI variant: SIMD-accelerated dsps_fft2r_fc32 on ESP32-S3 returns a
+  // constant 1.6 in every imaginary bin from zero input (verified empirically
+  // 2026-05-15). Bug is in dsps_fft2r_fc32_aes3_.S (community-contributed
+  // assembly, esp-dsp 1.8.2). ae32 SIMD doesn't run on S3 either (crashes).
+  // ANSI is correct; ~14% of 1 core for 23 FFTs/s — well within budget.
+  dsps_fft2r_fc32_ansi(fft_work, FFT_SIZE);
+  dsps_bit_rev_fc32_ansi(fft_work, FFT_SIZE);
 
-  // Hann coherent-gain compensation: sum(hann) / N = 0.5 → multiply by 2.
-  // But we work with magnitude squared, so factor 4 in linear energy.
-  // We'll absorb the global scale into calibration; just compute |X[k]|^2 here.
+  // Hann window's global power gain (0.375) is absorbed into the calibration
+  // offset — no per-frame compensation needed.
 
-  // Accumulate magnitude-squared into bands.
+  // Accumulate magnitude-squared into bands (for the 31-band per-second display).
   for (int b = 0; b < NOISE_BANDS; b++) {
     int start = band_start_bin[b];
     int end = band_start_bin[b + 1];
@@ -265,17 +307,33 @@ static void run_fft_and_accumulate(void) {
       float im = fft_work[2 * k + 1];
       sum += (double)re * re + (double)im * im;
     }
-    // Normalize by number of bins in the band so it's a per-bin mean.
-    band_energy_sum[b] += sum / (double)(end - start);
+    // Sum total band power (not per-bin mean): correct for 1/3-octave SPL
+    // and gives flat frequency response under broadband signals.
+    band_energy_sum[b] += sum;
   }
+
+  // Per-bin A/C weighted accumulation for LAeq/LCeq. Applying the weight at
+  // each bin's exact frequency (vs. at band centers) eliminates the
+  // frequency-quantization error that overestimates tones between band
+  // centers — especially at low frequencies where bands are only a few bins
+  // wide.
+  double a_sum = 0.0, c_sum = 0.0;
+  for (int k = 1; k < FFT_SIZE / 2; k++) {
+    float re = fft_work[2 * k];
+    float im = fft_work[2 * k + 1];
+    double bin_energy = (double)re * re + (double)im * im;
+    a_sum += bin_energy * (double)a_weight_bin[k];
+    c_sum += bin_energy * (double)c_weight_bin[k];
+  }
+  a_weighted_sum_per_sec += a_sum;
+  c_weighted_sum_per_sec += c_sum;
+  if (a_sum > a_weighted_max_per_fft) a_weighted_max_per_fft = a_sum;
+  if (c_sum > c_weighted_max_per_fft) c_weighted_max_per_fft = c_sum;
+
   fft_windows_in_second++;
 }
 
 // --- Aggregate ring helpers --------------------------------------------------
-static void push_ring_1m(float lin)  { laeq_ring_1m[ring_idx_1m] = lin; }
-static void push_ring_15m(float lin) { laeq_ring_15m[ring_idx_15m] = lin; }
-static void push_ring_30m(float lin) { laeq_ring_30m[ring_idx_30m] = lin; }
-
 static float compute_leq_from_ring(const float* ring, int size, int valid) {
   if (valid <= 0) return 0.0f;
   double sum = 0.0;
@@ -284,46 +342,56 @@ static float compute_leq_from_ring(const float* ring, int size, int valid) {
   return 10.0f * log10f((float)(sum / (double)valid));
 }
 
-uint8_t audio_dsp_get_laeq_1m(uint16_t* sec_out) {
-  int valid = total_seconds < RING_1M ? total_seconds : RING_1M;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(compute_leq_from_ring(laeq_ring_1m, RING_1M, valid));
-}
 uint8_t audio_dsp_get_laeq_15m(uint16_t* sec_out) {
   int valid = total_seconds < RING_15M ? total_seconds : RING_15M;
   if (sec_out) *sec_out = (uint16_t)valid;
   return encode_db_to_byte(compute_leq_from_ring(laeq_ring_15m, RING_15M, valid));
-}
-uint8_t audio_dsp_get_laeq_30m(uint16_t* sec_out) {
-  int valid = total_seconds < RING_30M ? total_seconds : RING_30M;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(compute_leq_from_ring(laeq_ring_30m, RING_30M, valid));
-}
-uint8_t audio_dsp_get_lceq_1m(uint16_t* sec_out) {
-  int valid = total_seconds < RING_1M ? total_seconds : RING_1M;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(compute_leq_from_ring(lceq_ring_1m, RING_1M, valid));
 }
 uint8_t audio_dsp_get_lceq_15m(uint16_t* sec_out) {
   int valid = total_seconds < RING_15M ? total_seconds : RING_15M;
   if (sec_out) *sec_out = (uint16_t)valid;
   return encode_db_to_byte(compute_leq_from_ring(lceq_ring_15m, RING_15M, valid));
 }
-uint8_t audio_dsp_get_lafmax_1m(uint16_t* sec_out) {
-  int valid = total_seconds < RING_1M ? total_seconds : RING_1M;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  if (valid <= 0) return 0;
-  float mx = 0.0f;
-  for (int i = 0; i < valid; i++) if (lafmax_ring_1m[i] > mx) mx = lafmax_ring_1m[i];
-  return encode_db_to_byte(mx);  // ring stores dB
+
+// --- Shared record → protobuf helpers ----------------------------------------
+void record_to_pb(const record_t* r, NoiseRecording_Record* out) {
+  out->seq_no = r->seq_no;
+  memcpy(out->bands, r->bands, sizeof(r->bands));
+  out->laeq_1s   = r->laeq_1s;
+  out->lceq_1s   = r->lceq_1s;
+  out->lafmax_1s = r->lafmax_1s;
+  out->lcfmax_1s = r->lcfmax_1s;
+  out->lcpeak_1s = r->lcpeak_1s;
 }
-uint8_t audio_dsp_get_lcpeak_1m(uint16_t* sec_out) {
-  int valid = total_seconds < RING_1M ? total_seconds : RING_1M;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  if (valid <= 0) return 0;
-  float mx = 0.0f;
-  for (int i = 0; i < valid; i++) if (lcpeak_ring_1m[i] > mx) mx = lcpeak_ring_1m[i];
-  return encode_db_to_byte(mx);
+
+size_t record_encode_single(const record_t* r, uint8_t* out, size_t cap) {
+  // Stream the NoiseRecording without staging the full struct: with
+  // max_count:300 a stack-allocated NoiseRecording is ~12 KB and overflows
+  // the 4 KB publisher task stacks. Only the single sub-Record is staged
+  // here (40 bytes).
+  NoiseRecording_Record sub;
+  record_to_pb(r, &sub);
+
+  pb_ostream_t stream = pb_ostream_from_buffer(out, cap);
+  // Field 2: repeated NoiseRecording.Record records (= one Record)
+  if (!pb_encode_tag(&stream, PB_WT_STRING, 2)) goto fail;
+  if (!pb_encode_submessage(&stream, NoiseRecording_Record_fields, &sub)) goto fail;
+  // Field 3: laeq_15m (uint32 varint)
+  if (!pb_encode_tag(&stream, PB_WT_VARINT, 3)) goto fail;
+  if (!pb_encode_varint(&stream, audio_dsp_get_laeq_15m(NULL))) goto fail;
+  // Field 4: lceq_15m (uint32 varint)
+  if (!pb_encode_tag(&stream, PB_WT_VARINT, 4)) goto fail;
+  if (!pb_encode_varint(&stream, audio_dsp_get_lceq_15m(NULL))) goto fail;
+  // Field 5: battery_mv (optional) — omitted when USB is connected, since
+  // the battery voltage reading isn't meaningful while charging.
+  if (usb_voltage <= 1000 && battery_voltage > 0) {
+    if (!pb_encode_tag(&stream, PB_WT_VARINT, 5)) goto fail;
+    if (!pb_encode_varint(&stream, (uint64_t)battery_voltage)) goto fail;
+  }
+  return stream.bytes_written;
+fail:
+  ESP_LOGW(TAG, "record_encode_single: %s", stream.errmsg);
+  return 0;
 }
 
 // --- Per-second emission -----------------------------------------------------
@@ -335,62 +403,54 @@ uint8_t audio_dsp_get_lcpeak_1m(uint16_t* sec_out) {
 // with proper Fast time-weighting (125 ms exponential smoother).
 static void emit_per_second(void) {
   float cal = calibration_offset_db();
-  float band_db[NOISE_BANDS];
 
-  // Energy mean per band → dB. A fixed reference offset converts the
-  // numerical FFT magnitude to dB SPL via calibration; here we just convert
-  // the linear energy to dB-relative-to-ref and let the cal offset map it
-  // onto an SPL scale.
-  for (int b = 0; b < NOISE_BANDS; b++) {
-    double mean = (fft_windows_in_second > 0)
-        ? band_energy_sum[b] / (double)fft_windows_in_second
-        : 0.0;
-    float db = (mean > 0.0) ? 10.0f * log10f((float)mean) : -100.0f;
-    band_db[b] = db + cal;
-  }
+  // LAeq,1s and LCeq,1s from per-bin-weighted FFT energy (accumulated in
+  // run_fft_and_accumulate). This applies the IEC 61672 A/C filter at each
+  // bin's actual frequency, eliminating the band-center quantization error.
+  double a_mean = (fft_windows_in_second > 0)
+      ? a_weighted_sum_per_sec / (double)fft_windows_in_second
+      : 0.0;
+  double c_mean = (fft_windows_in_second > 0)
+      ? c_weighted_sum_per_sec / (double)fft_windows_in_second
+      : 0.0;
+  float laeq_db = (a_mean > 0.0) ? 10.0f * log10f((float)a_mean) + cal : 0.0f;
+  float lceq_db = (c_mean > 0.0) ? 10.0f * log10f((float)c_mean) + cal : 0.0f;
 
-  // LAeq,1s and LCeq,1s via spec-appendix weighting tables.
-  double a_sum_lin = 0.0, c_sum_lin = 0.0;
-  for (int b = 0; b < NOISE_BANDS; b++) {
-    a_sum_lin += pow(10.0, (band_db[b] + a_weight_db[b]) / 10.0);
-    c_sum_lin += pow(10.0, (band_db[b] + c_weight_db[b]) / 10.0);
-  }
-  float laeq_db = (a_sum_lin > 0.0) ? 10.0f * log10f((float)a_sum_lin) : 0.0f;
-  float lceq_db = (c_sum_lin > 0.0) ? 10.0f * log10f((float)c_sum_lin) : 0.0f;
-
-  // Fast (125 ms) time-weighted max and true peak should come from a
-  // per-sample biquad cascade — not implemented yet. Approximate Fast-max
-  // as Leq (slightly biased low) and peak as the unweighted absolute peak.
+  // LAFmax/LCFmax: max single-FFT A/C-weighted energy seen this second.
+  // 85 ms FFT window approximates Fast time-weighting; not a perfect IEC
+  // 61672 implementation (no exponential smoother) but captures intra-second
+  // peaks that the per-second average can't.
+  float lafmax_db = (a_weighted_max_per_fft > 0.0)
+      ? 10.0f * log10f((float)a_weighted_max_per_fft) + cal : 0.0f;
+  float lcfmax_db = (c_weighted_max_per_fft > 0.0)
+      ? 10.0f * log10f((float)c_weighted_max_per_fft) + cal : 0.0f;
+  // LCpeak: unweighted absolute sample peak (v1 approximation; proper
+  // implementation needs C-weighted time-domain samples via IIR).
   float lcpeak_db = (peak_abs_sample_in_second > 0.0f)
       ? 20.0f * log10f(peak_abs_sample_in_second) + cal
       : 0.0f;
-  float lafmax_db = laeq_db;
-  float lcfmax_db = lceq_db;
 
   EventBits_t bits = xEventGroupGetBits(event_group);
   bool calibrated = (bits & CALIBRATED) != 0;
   bool time_set   = (bits & TIME_SET) != 0;
 
-  // Update aggregate rings (in linear energy for Leq, raw dB for max/peak).
+  // Update the 15-min sliding rings (linear energy).
   float laeq_lin = (float)pow(10.0, laeq_db / 10.0);
   float lceq_lin = (float)pow(10.0, lceq_db / 10.0);
-  laeq_ring_1m[ring_idx_1m]   = laeq_lin;
-  lceq_ring_1m[ring_idx_1m]   = lceq_lin;
-  lafmax_ring_1m[ring_idx_1m] = lafmax_db;
-  lcpeak_ring_1m[ring_idx_1m] = lcpeak_db;
-  ring_idx_1m = (ring_idx_1m + 1) % RING_1M;
   laeq_ring_15m[ring_idx_15m] = laeq_lin;
   lceq_ring_15m[ring_idx_15m] = lceq_lin;
   ring_idx_15m = (ring_idx_15m + 1) % RING_15M;
-  laeq_ring_30m[ring_idx_30m] = laeq_lin;
-  ring_idx_30m = (ring_idx_30m + 1) % RING_30M;
-  if (total_seconds < RING_30M) total_seconds++;
+  if (total_seconds < RING_15M) total_seconds++;
 
   if (calibrated && time_set) {
     record_t r = { 0 };
     r.seq_no    = seq_no++;
     for (int b = 0; b < NOISE_BANDS; b++) {
-      r.bands[b] = encode_db_to_byte(band_db[b]);
+      double mean = (fft_windows_in_second > 0)
+          ? band_energy_sum[b] / (double)fft_windows_in_second
+          : 0.0;
+      float db = (mean > 0.0) ? 10.0f * log10f((float)mean) + cal : 0.0f;
+      r.bands[b] = encode_db_to_byte(db);
     }
     r.laeq_1s   = encode_db_to_byte(laeq_db);
     r.lceq_1s   = encode_db_to_byte(lceq_db);
@@ -423,6 +483,10 @@ static void emit_per_second(void) {
 
   // Reset per-second accumulators
   for (int b = 0; b < NOISE_BANDS; b++) band_energy_sum[b] = 0.0;
+  a_weighted_sum_per_sec = 0.0;
+  c_weighted_sum_per_sec = 0.0;
+  a_weighted_max_per_fft = 0.0;
+  c_weighted_max_per_fft = 0.0;
   fft_windows_in_second = 0;
   broadband_samples_in_second = 0;
   peak_abs_sample_in_second = 0.0f;
@@ -458,7 +522,7 @@ void audio_dsp(void* params) {
     int frames = bytes_read / sizeof(int32_t);
 
     for (int i = 0; i < frames; i++) {
-      // ICS-43434 outputs 24-bit signed left-aligned in 32-bit slot.
+      // INMP441 outputs 24-bit signed left-aligned in 32-bit slot.
       int32_t s24 = raw_buffer[i] >> 8;
       float f = (float)s24 / 8388608.0f;   // 2^23
 

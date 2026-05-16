@@ -8,8 +8,7 @@
 
 static const char* TAG = "calibration";
 
-static float   offset_db   = 0.0f;
-static int32_t offset_x100 = 0;
+static float offset_db = 0.0f;
 
 void calibration_init(void) {
   nvs_handle_t handle;
@@ -33,7 +32,6 @@ void calibration_init(void) {
     ESP_LOGE(TAG, "nvs_get_i32 failed: %s", esp_err_to_name(err));
     return;
   }
-  offset_x100 = v;
   offset_db = v / 100.0f;
   xEventGroupSetBits(event_group, CALIBRATED);
   ESP_LOGI(TAG, "calibration loaded: offset=%+.2f dB", offset_db);
@@ -48,7 +46,6 @@ esp_err_t calibration_set(int32_t offset_db_x100) {
   nvs_close(handle);
   if (err != ESP_OK) return err;
 
-  offset_x100 = offset_db_x100;
   offset_db = offset_db_x100 / 100.0f;
   xEventGroupSetBits(event_group, CALIBRATED);
   return ESP_OK;
@@ -65,7 +62,6 @@ esp_err_t calibration_clear(void) {
   }
   nvs_close(handle);
 
-  offset_x100 = 0;
   offset_db = 0.0f;
   xEventGroupClearBits(event_group, CALIBRATED);
   return err;
@@ -75,6 +71,3 @@ float calibration_offset_db(void) {
   return offset_db;
 }
 
-int32_t calibration_offset_x100(void) {
-  return offset_x100;
-}

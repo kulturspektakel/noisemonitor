@@ -85,3 +85,10 @@ CONFIG_LWIP_TCP_WND_DEFAULT=2880
 # uploads are ~15 KB; 4096 is plenty for both with a margin.
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+
+# Power management — dynamic frequency scaling + auto light-sleep between
+# task activations. esp_pm_configure() in main.c sets the actual ceiling and
+# floor. Tickless idle lets FreeRTOS skip ticks while sleeping. I²S/BLE/WiFi
+# drivers acquire PM locks while busy so stream and timing are preserved.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y

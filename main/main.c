@@ -8,6 +8,7 @@
 #include "esp_event.h"
 #include "esp_littlefs.h"
 #include "esp_log.h"
+#include "esp_pm.h"
 #include "event_group.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,10 +27,21 @@ EventGroupHandle_t event_group;
 SemaphoreHandle_t network_request;
 
 void app_main(void) {
+  // Dynamic frequency scaling: cap at 160 MHz (where DSP comfortably fits),
+  // let the chip drop to 40 MHz and light-sleep between activations. Drivers
+  // acquire PM locks while busy, so audio I²S, WiFi, and BLE timing are
+  // preserved. CPU at idle drops from ~25 mA to a fraction of that.
+  esp_pm_config_t pm_cfg = {
+      .max_freq_mhz = 160,
+      .min_freq_mhz = 40,
+      .light_sleep_enable = true,
+  };
+  ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
+
   heap_diag("before preinit");
 
-  // Reserve the FFT twiddle table early. With radix-2 it's only 16 KB and
-  // fits anywhere — no special ordering needed against WiFi/BLE.
+  // Reserve the FFT twiddle table early (16 KB). LogMessage is in BSS
+  // (record_writer.c) so it doesn't go through heap.
   ESP_ERROR_CHECK(audio_dsp_preinit());
 
   heap_diag("after fft_table alloc");
@@ -53,6 +65,12 @@ void app_main(void) {
 
   // Load persisted calibration into the in-RAM offset + set CALIBRATED bit if present.
   calibration_init();
+
+  // TEMP: force calibration offset until USB-Serial-JTAG console input works.
+  // After switching band aggregation from per-bin mean to total band power,
+  // the 1 kHz band gains ~13 dB → drop offset from 6450 → 5150 (= +51.50 dB).
+  // Re-test with 1 kHz tone and adjust.
+  calibration_set(5150);
 
   // Inter-task queues (spec §6). Sized 16 = ~16 s of buffering against any
   // reasonable consumer delay. DSP sends are non-blocking.

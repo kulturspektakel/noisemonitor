@@ -13,108 +13,51 @@ static const char* TAG = "ble_publisher";
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "calibration.h"
 #include "constants.h"
 #include "esp_app_desc.h"
-#include "esp_timer.h"
 #include "event_group.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
-#include "log_uploader.h"
+#include "nanopb/pb_encode.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
-#include "power_management.h"
+#include "noise.pb.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
 // --- Custom service / characteristic UUIDs -----------------------------------
 //
 // Base UUID for noise service: 7ed2f2c4-69e8-4f7c-9c93-7a3b1e5d0a00
-// Per-characteristic UUIDs increment the last byte. Bytes are little-endian
-// in the BLE_UUID128_INIT macro.
+// The single `record` characteristic uses the same base with last byte 0x01.
+// Bytes are little-endian in the BLE_UUID128_INIT macro.
 #define NOISE_UUID_BASE(last) BLE_UUID128_INIT( \
     (last), 0x0a, 0x5d, 0x1e, 0x3b, 0x7a, 0x93, 0x9c,    \
     0x7c, 0x4f, 0xe8, 0x69, 0xc4, 0xf2, 0xd2, 0x7e)
 
-static const ble_uuid128_t noise_svc_uuid          = NOISE_UUID_BASE(0x00);
-static const ble_uuid128_t chr_status_uuid         = NOISE_UUID_BASE(0x01);
-static const ble_uuid128_t chr_laeq_1s_uuid        = NOISE_UUID_BASE(0x02);
-static const ble_uuid128_t chr_laeq_1m_uuid        = NOISE_UUID_BASE(0x03);
-static const ble_uuid128_t chr_laeq_15m_uuid       = NOISE_UUID_BASE(0x04);
-static const ble_uuid128_t chr_laeq_30m_uuid       = NOISE_UUID_BASE(0x05);
-static const ble_uuid128_t chr_lceq_1m_uuid        = NOISE_UUID_BASE(0x06);
-static const ble_uuid128_t chr_lceq_15m_uuid       = NOISE_UUID_BASE(0x07);
-static const ble_uuid128_t chr_lafmax_1m_uuid      = NOISE_UUID_BASE(0x08);
-static const ble_uuid128_t chr_lcpeak_1m_uuid      = NOISE_UUID_BASE(0x09);
-static const ble_uuid128_t chr_battery_uuid        = NOISE_UUID_BASE(0x0a);
-static const ble_uuid128_t chr_uptime_uuid         = NOISE_UUID_BASE(0x0b);
-static const ble_uuid128_t chr_cal_offset_uuid     = NOISE_UUID_BASE(0x0c);
+static const ble_uuid128_t noise_svc_uuid  = NOISE_UUID_BASE(0x00);
+static const ble_uuid128_t chr_record_uuid = NOISE_UUID_BASE(0x01);
 
-// Discriminator passed via NimBLE's `.arg` field (a void*) so a single
-// `access_cb` knows which characteristic it's serving. Cast to void* via
-// CHR_TAG so the compiler doesn't complain about the int→pointer conversion.
-enum chr_tag {
-  TAG_LAEQ_1S = 1,    // start at 1: NULL=0 would be ambiguous
-  TAG_LAEQ_1M,
-  TAG_LAEQ_15M,
-  TAG_LAEQ_30M,
-  TAG_LCEQ_1M,
-  TAG_LCEQ_15M,
-  TAG_LAFMAX_1M,
-  TAG_LCPEAK_1M,
-};
-#define CHR_TAG(t) ((void*)(uintptr_t)(t))
+// Value handle filled by the stack at GATT registration.
+static uint16_t h_record = 0;
 
-// --- Characteristic value handles (filled by stack at GATT registration) -----
-static uint16_t h_status        = 0;
-static uint16_t h_laeq_1s       = 0;
-static uint16_t h_laeq_1m       = 0;
-static uint16_t h_laeq_15m      = 0;
-static uint16_t h_laeq_30m      = 0;
-static uint16_t h_lceq_1m       = 0;
-static uint16_t h_lceq_15m      = 0;
-static uint16_t h_lafmax_1m     = 0;
-static uint16_t h_lcpeak_1m     = 0;
-static uint16_t h_battery       = 0;
-static uint16_t h_uptime        = 0;
-static uint16_t h_cal_offset    = 0;
+// Connection + subscription state.
+static volatile uint16_t curr_conn       = 0xffff;
+static volatile bool     record_subscribed = false;
 
-// --- Subscription tracking ---------------------------------------------------
-// Each characteristic with NOTIFY can be enabled by a client via CCCD write.
-// NimBLE delivers these as BLE_GAP_EVENT_SUBSCRIBE.
-typedef struct {
-  uint16_t* h;
-  bool subscribed;
-} sub_state_t;
-
-static sub_state_t subs[] = {
-  { &h_status,     false },
-  { &h_laeq_1s,    false },
-  { &h_laeq_1m,    false },
-  { &h_laeq_15m,   false },
-  { &h_laeq_30m,   false },
-  { &h_lceq_1m,    false },
-  { &h_lceq_15m,   false },
-  { &h_lafmax_1m,  false },
-  { &h_lcpeak_1m,  false },
-  { &h_battery,    false },
-};
-
-static volatile uint16_t curr_conn = 0xffff;
-
-// --- Cached last-notified values (for change-based notify) -------------------
-static uint8_t  last_laeq_15m   = 0;
-static uint8_t  last_laeq_30m   = 0;
-static uint8_t  last_lceq_15m   = 0;
-static uint16_t last_battery_mv = 0;
-static uint8_t  last_status_flags = 0xff;     // force initial notify
-static uint16_t last_status_pending = 0xffff;
-static int64_t  last_status_us = 0;
-static int64_t  last_battery_us = 0;
-static int64_t  last_laeq_15m_us = 0;
-static int64_t  last_laeq_30m_us = 0;
-static int64_t  last_lceq_15m_us = 0;
+// Cached encoding of the latest record. Used by the READ callback (NimBLE
+// host task) and refreshed by the publisher task after each notify. A mutex
+// guards the buffer because the encoder and the reader run on different
+// tasks. The notify path itself doesn't need the mutex — it encodes into a
+// local buffer and hands the mbuf to NimBLE.
+//
+// 128 bytes comfortably exceeds the encoded NoiseRecording-with-one-Record
+// size (Record_size = 69, plus a few bytes of wrapper overhead).
+#define ENCODED_BUF_SZ 128
+static uint8_t            cached_buf[ENCODED_BUF_SZ];
+static size_t             cached_len = 0;
+static SemaphoreHandle_t  cached_mtx = NULL;
 
 // --- DIS strings -------------------------------------------------------------
 static const char manufacturer_name[] = "Kulturspektakel";
@@ -122,20 +65,8 @@ static char firmware_revision[16] = "unknown";
 static char serial_number[DEVICE_ID_LENGTH + 1];
 
 // --- Access callbacks --------------------------------------------------------
-static int read_status(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
-static int read_uint8(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
-static int read_uint8_with_seconds(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
-static int read_battery(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
-static int read_uptime(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
-static int read_cal_offset(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
+static int read_record(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 static int read_dis_string(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
-
-// Latest sampled values (for read access and periodic notify).
-static volatile uint8_t  v_laeq_1s = 0;
-static volatile uint8_t  v_lceq_1s = 0;
-static volatile uint8_t  v_lafmax_1s = 0;
-static volatile uint8_t  v_lcfmax_1s = 0;
-static volatile uint8_t  v_lcpeak_1s = 0;
 
 // --- GATT service definition -------------------------------------------------
 static const struct ble_gatt_svc_def gatt_svcs[] = {
@@ -156,30 +87,8 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     .type = BLE_GATT_SVC_TYPE_PRIMARY,
     .uuid = &noise_svc_uuid.u,
     .characteristics = (struct ble_gatt_chr_def[]) {
-      { .uuid = &chr_status_uuid.u,      .access_cb = read_status,
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_status },
-      { .uuid = &chr_laeq_1s_uuid.u,     .access_cb = read_uint8, .arg = CHR_TAG(TAG_LAEQ_1S),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_laeq_1s },
-      { .uuid = &chr_laeq_1m_uuid.u,     .access_cb = read_uint8, .arg = CHR_TAG(TAG_LAEQ_1M),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_laeq_1m },
-      { .uuid = &chr_laeq_15m_uuid.u,    .access_cb = read_uint8_with_seconds, .arg = CHR_TAG(TAG_LAEQ_15M),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_laeq_15m },
-      { .uuid = &chr_laeq_30m_uuid.u,    .access_cb = read_uint8_with_seconds, .arg = CHR_TAG(TAG_LAEQ_30M),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_laeq_30m },
-      { .uuid = &chr_lceq_1m_uuid.u,     .access_cb = read_uint8, .arg = CHR_TAG(TAG_LCEQ_1M),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_lceq_1m },
-      { .uuid = &chr_lceq_15m_uuid.u,    .access_cb = read_uint8_with_seconds, .arg = CHR_TAG(TAG_LCEQ_15M),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_lceq_15m },
-      { .uuid = &chr_lafmax_1m_uuid.u,   .access_cb = read_uint8, .arg = CHR_TAG(TAG_LAFMAX_1M),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_lafmax_1m },
-      { .uuid = &chr_lcpeak_1m_uuid.u,   .access_cb = read_uint8, .arg = CHR_TAG(TAG_LCPEAK_1M),
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_lcpeak_1m },
-      { .uuid = &chr_battery_uuid.u,     .access_cb = read_battery,
-        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_battery },
-      { .uuid = &chr_uptime_uuid.u,      .access_cb = read_uptime,
-        .flags = BLE_GATT_CHR_F_READ, .val_handle = &h_uptime },
-      { .uuid = &chr_cal_offset_uuid.u,  .access_cb = read_cal_offset,
-        .flags = BLE_GATT_CHR_F_READ, .val_handle = &h_cal_offset },
+      { .uuid = &chr_record_uuid.u, .access_cb = read_record,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_record },
       { 0 },
     },
   },
@@ -194,78 +103,18 @@ static int read_dis_string(
   return os_mbuf_append(ctxt->om, s, strlen(s)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
-static int read_status(
+static int read_record(
     uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
 ) {
-  EventBits_t bits = xEventGroupGetBits(event_group);
-  uint8_t flags = 0;
-  if (bits & WIFI_CONNECTED) flags |= 0x01;
-  if (bits & USB_CONNECTED)  flags |= 0x02;
-  if (bits & CALIBRATED)     flags |= 0x04;
-  if (bits & TIME_SET)       flags |= 0x08;
-  uint16_t pending = (uint16_t)log_files_to_upload;
-  uint8_t payload[3] = { flags, (uint8_t)(pending & 0xff), (uint8_t)(pending >> 8) };
-  return os_mbuf_append(ctxt->om, payload, sizeof(payload)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-}
-
-static uint8_t pull_uint8_by_tag(int tag) {
-  switch (tag) {
-    case TAG_LAEQ_1S:    return v_laeq_1s;
-    case TAG_LAEQ_1M:    return audio_dsp_get_laeq_1m(NULL);
-    case TAG_LCEQ_1M:    return audio_dsp_get_lceq_1m(NULL);
-    case TAG_LAFMAX_1M:  return audio_dsp_get_lafmax_1m(NULL);
-    case TAG_LCPEAK_1M:  return audio_dsp_get_lcpeak_1m(NULL);
-    default: return 0;
+  int rc = 0;
+  xSemaphoreTake(cached_mtx, portMAX_DELAY);
+  if (cached_len > 0) {
+    if (os_mbuf_append(ctxt->om, cached_buf, cached_len) != 0) {
+      rc = BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
   }
-}
-
-static int read_uint8(
-    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
-) {
-  uint8_t v = pull_uint8_by_tag((int)(uintptr_t)arg);
-  return os_mbuf_append(ctxt->om, &v, 1) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-}
-
-static int read_uint8_with_seconds(
-    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
-) {
-  int tag = (int)(uintptr_t)arg;
-  uint16_t seconds = 0;
-  uint8_t v = 0;
-  switch (tag) {
-    case TAG_LAEQ_15M:   v = audio_dsp_get_laeq_15m(&seconds); break;
-    case TAG_LAEQ_30M:   v = audio_dsp_get_laeq_30m(&seconds); break;
-    case TAG_LCEQ_15M:   v = audio_dsp_get_lceq_15m(&seconds); break;
-  }
-  uint8_t payload[3] = { v, (uint8_t)(seconds & 0xff), (uint8_t)(seconds >> 8) };
-  return os_mbuf_append(ctxt->om, payload, sizeof(payload)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-}
-
-static int read_battery(
-    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
-) {
-  uint16_t mv = (uint16_t)battery_voltage;
-  uint8_t payload[2] = { (uint8_t)(mv & 0xff), (uint8_t)(mv >> 8) };
-  return os_mbuf_append(ctxt->om, payload, sizeof(payload)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-}
-
-static int read_uptime(
-    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
-) {
-  uint32_t secs = (uint32_t)(esp_timer_get_time() / 1000000ULL);
-  uint8_t payload[4] = {
-      (uint8_t)(secs & 0xff), (uint8_t)((secs >> 8) & 0xff),
-      (uint8_t)((secs >> 16) & 0xff), (uint8_t)((secs >> 24) & 0xff)
-  };
-  return os_mbuf_append(ctxt->om, payload, sizeof(payload)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
-}
-
-static int read_cal_offset(
-    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
-) {
-  int16_t v = (int16_t)calibration_offset_x100();
-  uint8_t payload[2] = { (uint8_t)(v & 0xff), (uint8_t)((v >> 8) & 0xff) };
-  return os_mbuf_append(ctxt->om, payload, sizeof(payload)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+  xSemaphoreGive(cached_mtx);
+  return rc;
 }
 
 // --- GAP --------------------------------------------------------------------
@@ -275,10 +124,10 @@ static char    adv_name[24];
 static int gap_event(struct ble_gap_event* ev, void* arg);
 
 static void start_advertising(void) {
-  // Primary advertisement: flags + complete name. The 17-char name plus the
-  // 3-byte flags field leaves no room for a 128-bit UUID (18 more bytes;
-  // 31-byte cap on primary adv). Put the UUID in the scan response packet
-  // instead, which is the standard pattern for named peripherals.
+  // Primary advertisement: flags + complete name. The name plus the 3-byte
+  // flags field leaves no room for a 128-bit UUID (18 more bytes; 31-byte
+  // cap on primary adv). Put the UUID in the scan response packet instead,
+  // which is the standard pattern for named peripherals.
   struct ble_hs_adv_fields adv_fields;
   memset(&adv_fields, 0, sizeof(adv_fields));
   adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
@@ -304,11 +153,15 @@ static void start_advertising(void) {
     return;
   }
 
+  // 5-second advertising interval saves power when nobody is connected;
+  // BLE advertising automatically pauses while connected, so there's no
+  // separate "faster when connected" branch needed — notifications carry
+  // data once a client connects.
   struct ble_gap_adv_params adv_params = {
       .conn_mode = BLE_GAP_CONN_MODE_UND,
       .disc_mode = BLE_GAP_DISC_MODE_GEN,
-      .itvl_min = BLE_GAP_ADV_ITVL_MS(1000),
-      .itvl_max = BLE_GAP_ADV_ITVL_MS(1000),
+      .itvl_min = BLE_GAP_ADV_ITVL_MS(5000),
+      .itvl_max = BLE_GAP_ADV_ITVL_MS(5000),
   };
   rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, gap_event, NULL);
   if (rc != 0) ESP_LOGE(TAG, "ble_gap_adv_start: %d", rc);
@@ -327,17 +180,14 @@ static int gap_event(struct ble_gap_event* ev, void* arg) {
     case BLE_GAP_EVENT_DISCONNECT:
       ESP_LOGI(TAG, "BLE client disconnected (reason %d)", ev->disconnect.reason);
       curr_conn = 0xffff;
-      for (size_t i = 0; i < sizeof(subs)/sizeof(subs[0]); i++) subs[i].subscribed = false;
+      record_subscribed = false;
       start_advertising();
       break;
-    case BLE_GAP_EVENT_SUBSCRIBE: {
-      uint16_t h = ev->subscribe.attr_handle;
-      bool en = ev->subscribe.cur_notify != 0;
-      for (size_t i = 0; i < sizeof(subs)/sizeof(subs[0]); i++) {
-        if (*subs[i].h == h) { subs[i].subscribed = en; break; }
+    case BLE_GAP_EVENT_SUBSCRIBE:
+      if (ev->subscribe.attr_handle == h_record) {
+        record_subscribed = ev->subscribe.cur_notify != 0;
       }
       break;
-    }
     case BLE_GAP_EVENT_MTU:
       ESP_LOGI(TAG, "MTU updated to %d", ev->mtu.value);
       break;
@@ -345,40 +195,6 @@ static int gap_event(struct ble_gap_event* ev, void* arg) {
       break;
   }
   return 0;
-}
-
-static bool is_subscribed(uint16_t h) {
-  for (size_t i = 0; i < sizeof(subs)/sizeof(subs[0]); i++) {
-    if (*subs[i].h == h) return subs[i].subscribed;
-  }
-  return false;
-}
-
-static void notify_uint8(uint16_t h, uint8_t v) {
-  if (curr_conn == 0xffff || !is_subscribed(h)) return;
-  struct os_mbuf* om = ble_hs_mbuf_from_flat(&v, 1);
-  if (om) ble_gatts_notify_custom(curr_conn, h, om);
-}
-
-static void notify_uint8_with_seconds(uint16_t h, uint8_t v, uint16_t seconds) {
-  if (curr_conn == 0xffff || !is_subscribed(h)) return;
-  uint8_t payload[3] = { v, (uint8_t)(seconds & 0xff), (uint8_t)(seconds >> 8) };
-  struct os_mbuf* om = ble_hs_mbuf_from_flat(payload, sizeof(payload));
-  if (om) ble_gatts_notify_custom(curr_conn, h, om);
-}
-
-static void notify_status(uint8_t flags, uint16_t pending) {
-  if (curr_conn == 0xffff || !is_subscribed(h_status)) return;
-  uint8_t payload[3] = { flags, (uint8_t)(pending & 0xff), (uint8_t)(pending >> 8) };
-  struct os_mbuf* om = ble_hs_mbuf_from_flat(payload, sizeof(payload));
-  if (om) ble_gatts_notify_custom(curr_conn, h_status, om);
-}
-
-static void notify_battery(uint16_t mv) {
-  if (curr_conn == 0xffff || !is_subscribed(h_battery)) return;
-  uint8_t payload[2] = { (uint8_t)(mv & 0xff), (uint8_t)(mv >> 8) };
-  struct os_mbuf* om = ble_hs_mbuf_from_flat(payload, sizeof(payload));
-  if (om) ble_gatts_notify_custom(curr_conn, h_battery, om);
 }
 
 // --- Host sync / host task ---------------------------------------------------
@@ -408,6 +224,7 @@ static void compose_adv_name(void) {
   }
 }
 
+
 void ble_publisher(void* params) {
   // Wait for device_id so the advertised name + DIS Serial Number reflect it.
   xEventGroupWaitBits(event_group, DEVICE_ID_LOADED, false, true, portMAX_DELAY);
@@ -416,6 +233,13 @@ void ble_publisher(void* params) {
   const esp_app_desc_t* d = esp_app_get_description();
   if (d) strlcpy(firmware_revision, d->version, sizeof(firmware_revision));
   compose_adv_name();
+
+  cached_mtx = xSemaphoreCreateMutex();
+  if (!cached_mtx) {
+    ESP_LOGE(TAG, "failed to create cached_mtx");
+    vTaskDelete(NULL);
+    return;
+  }
 
   heap_diag("before nimble_port_init");
   if (nimble_port_init() != ESP_OK) {
@@ -440,71 +264,26 @@ void ble_publisher(void* params) {
 
   ESP_LOGI(TAG, "BLE peripheral up; advertising as %s", adv_name);
 
-  // Drain loop: 1 Hz per-record updates + change/period checks for slow chars.
+  // Drain loop: encode each per-second record as the same protobuf bytes the
+  // MQTT publisher sends, notify if a subscriber is attached, and refresh the
+  // cached copy for on-demand READs.
+  uint8_t local_buf[ENCODED_BUF_SZ];
   while (true) {
     record_t r;
-    if (xQueueReceive(ble_publisher_queue, &r, pdMS_TO_TICKS(1000)) == pdTRUE) {
-      v_laeq_1s    = r.laeq_1s;
-      v_lceq_1s    = r.lceq_1s;
-      v_lafmax_1s  = r.lafmax_1s;
-      v_lcfmax_1s  = r.lcfmax_1s;
-      v_lcpeak_1s  = r.lcpeak_1s;
+    if (xQueueReceive(ble_publisher_queue, &r, portMAX_DELAY) != pdTRUE) continue;
 
-      notify_uint8(h_laeq_1s,    r.laeq_1s);
-      notify_uint8(h_laeq_1m,    audio_dsp_get_laeq_1m(NULL));
-      notify_uint8(h_lceq_1m,    audio_dsp_get_lceq_1m(NULL));
-      notify_uint8(h_lafmax_1m,  audio_dsp_get_lafmax_1m(NULL));
-      notify_uint8(h_lcpeak_1m,  audio_dsp_get_lcpeak_1m(NULL));
-    }
+    size_t n = record_encode_single(&r, local_buf, sizeof(local_buf));
+    if (n == 0) continue;
 
-    int64_t now = esp_timer_get_time();
+    // Refresh cached bytes for cold READs.
+    xSemaphoreTake(cached_mtx, portMAX_DELAY);
+    memcpy(cached_buf, local_buf, n);
+    cached_len = n;
+    xSemaphoreGive(cached_mtx);
 
-    // Status: notify on flag change OR pending change OR every 10 s.
-    EventBits_t bits = xEventGroupGetBits(event_group);
-    uint8_t flags = ((bits & WIFI_CONNECTED) ? 0x01 : 0)
-                  | ((bits & USB_CONNECTED)  ? 0x02 : 0)
-                  | ((bits & CALIBRATED)     ? 0x04 : 0)
-                  | ((bits & TIME_SET)       ? 0x08 : 0);
-    uint16_t pending = (uint16_t)log_files_to_upload;
-    bool changed = flags != last_status_flags || pending != last_status_pending;
-    if (changed || (now - last_status_us) >= 10 * 1000000) {
-      notify_status(flags, pending);
-      last_status_flags = flags;
-      last_status_pending = pending;
-      last_status_us = now;
-    }
-
-    // Battery: ≥50 mV change OR every 30 s.
-    uint16_t mv = (uint16_t)battery_voltage;
-    int dv = (int)mv - (int)last_battery_mv;
-    if (dv < 0) dv = -dv;
-    if (dv >= 50 || (now - last_battery_us) >= 30 * 1000000) {
-      notify_battery(mv);
-      last_battery_mv = mv;
-      last_battery_us = now;
-    }
-
-    // LAeq,15m / LAeq,30m / LCeq,15m: ≥0.5 dB change OR every 30 s.
-    // 0.5 dB in encoded uint8 is exactly 1 LSB.
-    uint16_t s15 = 0, s30 = 0, sc15 = 0;
-    uint8_t laeq_15m = audio_dsp_get_laeq_15m(&s15);
-    uint8_t laeq_30m = audio_dsp_get_laeq_30m(&s30);
-    uint8_t lceq_15m = audio_dsp_get_lceq_15m(&sc15);
-
-    if (laeq_15m != last_laeq_15m || (now - last_laeq_15m_us) >= 30 * 1000000) {
-      notify_uint8_with_seconds(h_laeq_15m, laeq_15m, s15);
-      last_laeq_15m = laeq_15m;
-      last_laeq_15m_us = now;
-    }
-    if (laeq_30m != last_laeq_30m || (now - last_laeq_30m_us) >= 30 * 1000000) {
-      notify_uint8_with_seconds(h_laeq_30m, laeq_30m, s30);
-      last_laeq_30m = laeq_30m;
-      last_laeq_30m_us = now;
-    }
-    if (lceq_15m != last_lceq_15m || (now - last_lceq_15m_us) >= 30 * 1000000) {
-      notify_uint8_with_seconds(h_lceq_15m, lceq_15m, sc15);
-      last_lceq_15m = lceq_15m;
-      last_lceq_15m_us = now;
+    if (curr_conn != 0xffff && record_subscribed) {
+      struct os_mbuf* om = ble_hs_mbuf_from_flat(local_buf, n);
+      if (om) ble_gatts_notify_custom(curr_conn, h_record, om);
     }
   }
 }

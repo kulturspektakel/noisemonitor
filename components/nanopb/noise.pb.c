@@ -6,10 +6,10 @@
 #error Regenerate this file with the current version of nanopb generator.
 #endif
 
-PB_BIND(Record, Record, AUTO)
+PB_BIND(NoiseRecording, NoiseRecording, 4)
 
 
-PB_BIND(NoiseRecording, NoiseRecording, 2)
+PB_BIND(NoiseRecording_Record, NoiseRecording_Record, AUTO)
 
 
 
