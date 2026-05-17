@@ -39,25 +39,32 @@ void time_sync(void* params) {
   // wait for wifi to connect
   xEventGroupWaitBits(event_group, WIFI_CONNECTED, false, true, portMAX_DELAY);
 
-  ESP_LOGI(TAG, "Fetching time from NTP");
-  esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+  // Multi-server SNTP: time.apple.com is whitelisted by iPhone hotspots;
+  // time.google.com and time.cloudflare.com are widely reachable and don't
+  // depend on the rotating pool.ntp.org pool resolving to a routable server.
+  esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(
+      3, ESP_SNTP_SERVER_LIST("time.apple.com", "time.google.com", "time.cloudflare.com"));
 
-  xSemaphoreTake(network_request, portMAX_DELAY);
-  esp_netif_sntp_init(&config);
-  esp_err_t ret = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000));
-  esp_netif_sntp_deinit();
-  xSemaphoreGive(network_request);
+  // Retry until success — exit only when TIME_SET fires.
+  while (!(xEventGroupGetBits(event_group) & TIME_SET)) {
+    ESP_LOGI(TAG, "Fetching time from NTP");
+    xSemaphoreTake(network_request, portMAX_DELAY);
+    esp_netif_sntp_init(&config);
+    esp_err_t ret = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(15000));
+    esp_netif_sntp_deinit();
+    xSemaphoreGive(network_request);
 
-  if (ret == ESP_OK) {
-    // set system time
-    time_t now;
-    time(&now);
-
-    // set RTC time
-    struct tm* timeinfo = gmtime(&now);
-    ESP_LOGI(TAG, "Received NTP time. Setting RTC to %s UTC", asctime(timeinfo));
-    ds3231_set_time(&dev, gmtime(&now));
-    xEventGroupSetBits(event_group, TIME_SET);
+    if (ret == ESP_OK) {
+      time_t now;
+      time(&now);
+      struct tm* timeinfo = gmtime(&now);
+      ESP_LOGI(TAG, "Received NTP time. Setting RTC to %s UTC", asctime(timeinfo));
+      ds3231_set_time(&dev, gmtime(&now));
+      xEventGroupSetBits(event_group, TIME_SET);
+      break;
+    }
+    ESP_LOGW(TAG, "NTP sync timed out; retrying in 60 s");
+    vTaskDelay(pdMS_TO_TICKS(60000));
   }
   ds3231_free_desc(&dev);
 

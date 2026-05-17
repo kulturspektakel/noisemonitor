@@ -92,3 +92,9 @@ CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 # drivers acquire PM locks while busy so stream and timing are preserved.
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+
+# Allow time_sync to query multiple NTP servers in one shot. Single-server
+# default (pool.ntp.org) failed reliably on phone hotspots and some Wi-Fi
+# routers; using time.apple.com / time.google.com / time.cloudflare.com as
+# fallbacks is much more robust.
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
