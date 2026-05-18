@@ -108,6 +108,8 @@ static void flush_to_file(void) {
   log_message_buf.noise_recording.records_count = records_count;
   log_message_buf.noise_recording.laeq_15m = audio_dsp_get_laeq_15m(NULL);
   log_message_buf.noise_recording.lceq_15m = audio_dsp_get_lceq_15m(NULL);
+  log_message_buf.noise_recording.laeq_5m  = audio_dsp_get_laeq_5m(NULL);
+  log_message_buf.noise_recording.lceq_5m  = audio_dsp_get_lceq_5m(NULL);
 
   ensure_free_space();
 

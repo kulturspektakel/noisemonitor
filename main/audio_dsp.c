@@ -334,23 +334,48 @@ static void run_fft_and_accumulate(void) {
 }
 
 // --- Aggregate ring helpers --------------------------------------------------
-static float compute_leq_from_ring(const float* ring, int size, int valid) {
+// Average the most-recent `n` entries from a circular ring. `head` is the
+// next-write index, so the freshest entry is at (head-1+size)%size.
+static float compute_leq_recent(
+    const float* ring, int size, int head, int n
+) {
+  int valid = total_seconds < n ? total_seconds : n;
   if (valid <= 0) return 0.0f;
   double sum = 0.0;
-  for (int i = 0; i < valid; i++) sum += ring[i];
+  for (int i = 1; i <= valid; i++) {
+    int idx = (head - i + size) % size;
+    sum += ring[idx];
+  }
   if (sum <= 0.0) return 0.0f;
   return 10.0f * log10f((float)(sum / (double)valid));
 }
 
-uint8_t audio_dsp_get_laeq_15m(uint16_t* sec_out) {
-  int valid = total_seconds < RING_15M ? total_seconds : RING_15M;
+#define WINDOW_5M_SEC  300
+#define WINDOW_15M_SEC RING_15M
+
+uint8_t audio_dsp_get_laeq_5m(uint16_t* sec_out) {
+  int valid = total_seconds < WINDOW_5M_SEC ? total_seconds : WINDOW_5M_SEC;
   if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(compute_leq_from_ring(laeq_ring_15m, RING_15M, valid));
+  return encode_db_to_byte(
+      compute_leq_recent(laeq_ring_15m, RING_15M, ring_idx_15m, WINDOW_5M_SEC));
+}
+uint8_t audio_dsp_get_lceq_5m(uint16_t* sec_out) {
+  int valid = total_seconds < WINDOW_5M_SEC ? total_seconds : WINDOW_5M_SEC;
+  if (sec_out) *sec_out = (uint16_t)valid;
+  return encode_db_to_byte(
+      compute_leq_recent(lceq_ring_15m, RING_15M, ring_idx_15m, WINDOW_5M_SEC));
+}
+uint8_t audio_dsp_get_laeq_15m(uint16_t* sec_out) {
+  int valid = total_seconds < WINDOW_15M_SEC ? total_seconds : WINDOW_15M_SEC;
+  if (sec_out) *sec_out = (uint16_t)valid;
+  return encode_db_to_byte(
+      compute_leq_recent(laeq_ring_15m, RING_15M, ring_idx_15m, WINDOW_15M_SEC));
 }
 uint8_t audio_dsp_get_lceq_15m(uint16_t* sec_out) {
-  int valid = total_seconds < RING_15M ? total_seconds : RING_15M;
+  int valid = total_seconds < WINDOW_15M_SEC ? total_seconds : WINDOW_15M_SEC;
   if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(compute_leq_from_ring(lceq_ring_15m, RING_15M, valid));
+  return encode_db_to_byte(
+      compute_leq_recent(lceq_ring_15m, RING_15M, ring_idx_15m, WINDOW_15M_SEC));
 }
 
 // --- Shared record → protobuf helpers ----------------------------------------
@@ -382,6 +407,11 @@ size_t record_encode_single(const record_t* r, uint8_t* out, size_t cap) {
   // Field 4: lceq_15m (uint32 varint)
   if (!pb_encode_tag(&stream, PB_WT_VARINT, 4)) goto fail;
   if (!pb_encode_varint(&stream, audio_dsp_get_lceq_15m(NULL))) goto fail;
+  // Field 6: laeq_5m, Field 7: lceq_5m
+  if (!pb_encode_tag(&stream, PB_WT_VARINT, 6)) goto fail;
+  if (!pb_encode_varint(&stream, audio_dsp_get_laeq_5m(NULL))) goto fail;
+  if (!pb_encode_tag(&stream, PB_WT_VARINT, 7)) goto fail;
+  if (!pb_encode_varint(&stream, audio_dsp_get_lceq_5m(NULL))) goto fail;
   // Field 5: battery_mv (optional) — omitted when USB is connected, since
   // the battery voltage reading isn't meaningful while charging.
   if (usb_voltage <= 1000 && battery_voltage > 0) {

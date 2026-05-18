@@ -35,7 +35,9 @@ void audio_dsp(void* params);
 // Aggregate snapshots. Returns a uint8 in spec §5 encoding (= (dB - 20) * 2).
 // `*seconds_out` reports how many seconds of the window have actually been
 // observed (saturating at window size). Pass NULL if not needed.
-// Only 15-minute windows are exposed — these feed NoiseRecording.{laeq,lceq}_15m.
+// 5- and 15-minute sliding windows. Both feed NoiseRecording.{laeq,lceq}_{5,15}m.
+uint8_t audio_dsp_get_laeq_5m(uint16_t* seconds_out);
+uint8_t audio_dsp_get_lceq_5m(uint16_t* seconds_out);
 uint8_t audio_dsp_get_laeq_15m(uint16_t* seconds_out);
 uint8_t audio_dsp_get_lceq_15m(uint16_t* seconds_out);
 

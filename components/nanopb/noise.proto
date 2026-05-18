@@ -17,4 +17,6 @@ message NoiseRecording {
   optional uint32 battery_mv = 5;  // battery voltage in millivolts; only set for
                                    // live MQTT/BLE messages and only when running
                                    // on battery (i.e. USB not connected)
+  uint32 laeq_5m            = 6;   // sliding-window LAeq over last 5 min, same encoding
+  uint32 lceq_5m            = 7;   // sliding-window LCeq over last 5 min, same encoding
 }

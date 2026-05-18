@@ -93,6 +93,8 @@ message NoiseRecording {
   uint32 lceq_15m           = 4;   // sliding-window LCeq over last 15 min, same encoding
   optional uint32 battery_mv = 5;  // only set on live (MQTT/BLE) when on battery
                                    //  (omitted when USB is connected)
+  uint32 laeq_5m            = 6;   // sliding-window LAeq over last 5 min, same encoding
+  uint32 lceq_5m            = 7;   // sliding-window LCeq over last 5 min, same encoding
 }
 ```
 
