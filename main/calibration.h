@@ -14,3 +14,7 @@ esp_err_t calibration_clear(void);
 
 // Returns the current offset in dB (0.0 while uncalibrated).
 float calibration_offset_db(void);
+
+// Returns the current offset in 1/100 dB units (the persisted form).
+// Useful for BLE/MQTT consumers that want to avoid float math.
+int32_t calibration_offset_x100(void);

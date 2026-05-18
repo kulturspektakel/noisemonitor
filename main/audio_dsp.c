@@ -437,8 +437,7 @@ static void emit_per_second(void) {
       : 0.0f;
 
   EventBits_t bits = xEventGroupGetBits(event_group);
-  bool calibrated = (bits & CALIBRATED) != 0;
-  bool time_set   = (bits & TIME_SET) != 0;
+  bool time_set = (bits & TIME_SET) != 0;
 
   // Update the 15-min sliding rings (linear energy).
   float laeq_lin = (float)pow(10.0, laeq_db / 10.0);
@@ -448,7 +447,7 @@ static void emit_per_second(void) {
   ring_idx_15m = (ring_idx_15m + 1) % RING_15M;
   if (total_seconds < RING_15M) total_seconds++;
 
-  if (calibrated && time_set) {
+  if (time_set) {
     record_t r = { 0 };
     r.seq_no    = seq_no++;
     for (int b = 0; b < NOISE_BANDS; b++) {
@@ -474,17 +473,8 @@ static void emit_per_second(void) {
       ESP_LOGW(TAG, "ble_publisher_queue full, dropping record %lu", (unsigned long)r.seq_no);
     }
   } else {
-    ESP_LOGI(
-        TAG, "NOT LOGGING — calibrated=%s, time_set=%s. Current readings (offset=%+.2f):",
-        calibrated ? "yes" : "no", time_set ? "yes" : "no", cal
-    );
-    ESP_LOGI(TAG, "  LAeq   = %.1f dB(A)", laeq_db);
-    ESP_LOGI(TAG, "  LCeq   = %.1f dB(C)", lceq_db);
-    ESP_LOGI(TAG, "  LAFmax = %.1f dB(A)", lafmax_db);
-    ESP_LOGI(TAG, "  LCpeak = %.1f dB(C)", lcpeak_db);
-    if (!calibrated) {
-      ESP_LOGI(TAG, "  To calibrate, send: CAL_SET <(reference - LAeq) * 100>");
-    }
+    ESP_LOGI(TAG, "waiting for time_set; current LAeq=%.1f LCeq=%.1f (cal offset=%+.2f)",
+             laeq_db, lceq_db, cal);
   }
 
   // Reset per-second accumulators

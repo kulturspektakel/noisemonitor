@@ -1,5 +1,6 @@
 #include "ble_publisher.h"
 #include "audio_dsp.h"
+#include "calibration.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -38,9 +39,11 @@ static const char* TAG = "ble_publisher";
 
 static const ble_uuid128_t noise_svc_uuid  = NOISE_UUID_BASE(0x00);
 static const ble_uuid128_t chr_record_uuid = NOISE_UUID_BASE(0x01);
+static const ble_uuid128_t chr_cal_uuid    = NOISE_UUID_BASE(0x02);
 
-// Value handle filled by the stack at GATT registration.
+// Value handles filled by the stack at GATT registration.
 static uint16_t h_record = 0;
+static uint16_t h_cal    = 0;
 
 // Connection + subscription state.
 static volatile uint16_t curr_conn       = 0xffff;
@@ -67,6 +70,7 @@ static char serial_number[DEVICE_ID_LENGTH + 1];
 // --- Access callbacks --------------------------------------------------------
 static int read_record(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 static int read_dis_string(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
+static int access_cal(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 
 // --- GATT service definition -------------------------------------------------
 static const struct ble_gatt_svc_def gatt_svcs[] = {
@@ -89,6 +93,11 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     .characteristics = (struct ble_gatt_chr_def[]) {
       { .uuid = &chr_record_uuid.u, .access_cb = read_record,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_record },
+      // Calibration offset, signed 32-bit hundredths of dB, little-endian.
+      // Read returns current offset; write persists to NVS and sets the
+      // CALIBRATED event bit (so the status LED turns green).
+      { .uuid = &chr_cal_uuid.u, .access_cb = access_cal,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE, .val_handle = &h_cal },
       { 0 },
     },
   },
@@ -115,6 +124,34 @@ static int read_record(
   }
   xSemaphoreGive(cached_mtx);
   return rc;
+}
+
+static int access_cal(
+    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
+) {
+  if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+    int32_t v = calibration_offset_x100();
+    return os_mbuf_append(ctxt->om, &v, sizeof(v)) == 0
+        ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+  }
+  if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+    if (OS_MBUF_PKTLEN(ctxt->om) != sizeof(int32_t)) {
+      return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    int32_t v = 0;
+    uint16_t copied = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, &v, sizeof(v), &copied) != 0 || copied != sizeof(v)) {
+      return BLE_ATT_ERR_UNLIKELY;
+    }
+    esp_err_t err = calibration_set(v);
+    if (err != ESP_OK) {
+      ESP_LOGW(TAG, "calibration_set(%ld) failed: %s", (long)v, esp_err_to_name(err));
+      return BLE_ATT_ERR_UNLIKELY;
+    }
+    ESP_LOGI(TAG, "calibration offset set via BLE: %+.2f dB", v / 100.0f);
+    return 0;
+  }
+  return BLE_ATT_ERR_UNLIKELY;
 }
 
 // --- GAP --------------------------------------------------------------------

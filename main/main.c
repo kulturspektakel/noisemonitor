@@ -64,13 +64,10 @@ void app_main(void) {
   gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
 
   // Load persisted calibration into the in-RAM offset + set CALIBRATED bit if present.
+  // Devices that have never been calibrated start with offset=0 and produce
+  // raw-FFT-magnitude dB values; the operator can calibrate via the BLE
+  // "cal_offset" characteristic (read/write int32 hundredths-of-dB).
   calibration_init();
-
-  // TEMP: force calibration offset until USB-Serial-JTAG console input works.
-  // After switching band aggregation from per-bin mean to total band power,
-  // the 1 kHz band gains ~13 dB → drop offset from 6450 → 5150 (= +51.50 dB).
-  // Re-test with 1 kHz tone and adjust.
-  calibration_set(5150);
 
   // Inter-task queues (spec §6). Sized 16 = ~16 s of buffering against any
   // reasonable consumer delay. DSP sends are non-blocking.
