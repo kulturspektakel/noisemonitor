@@ -82,8 +82,10 @@ void mqtt_publisher(void* params) {
     if (msg_id < 0) {
       ESP_LOGW(TAG, "publish failed");
     } else {
-      ESP_LOGI(TAG, "published seq=%lu LAeq=%.1f dB(A)",
-               (unsigned long)r.seq_no, 20.0f + r.laeq_1s / 2.0f);
+      ESP_LOGI(TAG, "published seq=%lu LAeq=%.1f LCpeak=%.1f",
+               (unsigned long)r.seq_no,
+               20.0f + r.laeq_1s / 2.0f,
+               20.0f + r.lcpeak_1s / 2.0f);
     }
   }
 }

@@ -424,10 +424,16 @@ static void emit_per_second(void) {
       ? 10.0f * log10f((float)a_weighted_max_per_fft) + cal : 0.0f;
   float lcfmax_db = (c_weighted_max_per_fft > 0.0)
       ? 10.0f * log10f((float)c_weighted_max_per_fft) + cal : 0.0f;
-  // LCpeak: unweighted absolute sample peak (v1 approximation; proper
-  // implementation needs C-weighted time-domain samples via IIR).
+  // LCpeak: unweighted absolute sample peak. Calibration's `cal` offset maps
+  // FFT-energy numbers to dB SPL, but the peak metric operates on raw [-1,1]
+  // sample amplitude — a scale that's ~60 dB different from FFT energy for
+  // our 4096-pt Hann-windowed FFT. The extra 20·log10(FFT_SIZE/4) term
+  // compensates so LCpeak ends up on the same dB SPL scale as LAeq/LCeq.
+  // (Still not C-weighted — proper LCpeak needs an IIR C-weight filter on
+  // the time-domain samples before the peak detector.)
+  const float lcpeak_offset = cal + 20.0f * log10f((float)FFT_SIZE / 4.0f);
   float lcpeak_db = (peak_abs_sample_in_second > 0.0f)
-      ? 20.0f * log10f(peak_abs_sample_in_second) + cal
+      ? 20.0f * log10f(peak_abs_sample_in_second) + lcpeak_offset
       : 0.0f;
 
   EventBits_t bits = xEventGroupGetBits(event_group);

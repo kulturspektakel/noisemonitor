@@ -124,44 +124,46 @@ static char    adv_name[24];
 static int gap_event(struct ble_gap_event* ev, void* arg);
 
 static void start_advertising(void) {
-  // Primary advertisement: flags + complete name. The name plus the 3-byte
-  // flags field leaves no room for a 128-bit UUID (18 more bytes; 31-byte
-  // cap on primary adv). Put the UUID in the scan response packet instead,
-  // which is the standard pattern for named peripherals.
+  // Primary advertisement: flags + the 128-bit service UUID. Web Bluetooth's
+  // `filters: [{services: [...]}]` only matches against primary-adv data, so
+  // the UUID has to live here for Chrome's device picker to find us. The
+  // full name goes in the scan response (most scanners combine both for
+  // display). Layout: flags (3 B) + UUID (16 + 2 = 18 B) = 21 B / 31 B max.
   struct ble_hs_adv_fields adv_fields;
   memset(&adv_fields, 0, sizeof(adv_fields));
   adv_fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-  adv_fields.name = (uint8_t*)adv_name;
-  adv_fields.name_len = strlen(adv_name);
-  adv_fields.name_is_complete = 1;
+  adv_fields.uuids128 = (ble_uuid128_t*)&noise_svc_uuid;
+  adv_fields.num_uuids128 = 1;
+  adv_fields.uuids128_is_complete = 1;
   int rc = ble_gap_adv_set_fields(&adv_fields);
   if (rc != 0) {
     ESP_LOGE(TAG, "ble_gap_adv_set_fields: %d", rc);
     return;
   }
 
-  // Scan response: the Custom Noise Service UUID, so phone apps can filter
-  // on it without needing to connect first.
+  // Scan response: the device name. Up to 29 bytes available here.
   struct ble_hs_adv_fields rsp_fields;
   memset(&rsp_fields, 0, sizeof(rsp_fields));
-  rsp_fields.uuids128 = (ble_uuid128_t*)&noise_svc_uuid;
-  rsp_fields.num_uuids128 = 1;
-  rsp_fields.uuids128_is_complete = 1;
+  rsp_fields.name = (uint8_t*)adv_name;
+  rsp_fields.name_len = strlen(adv_name);
+  rsp_fields.name_is_complete = 1;
   rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
   if (rc != 0) {
     ESP_LOGE(TAG, "ble_gap_adv_rsp_set_fields: %d", rc);
     return;
   }
 
-  // 5-second advertising interval saves power when nobody is connected;
-  // BLE advertising automatically pauses while connected, so there's no
-  // separate "faster when connected" branch needed — notifications carry
-  // data once a client connects.
+  // 250 ms advertising interval — fast enough that a phone scanner can both
+  // see the device AND complete a connect request within its typical 10 s
+  // scan window. The 5 s interval we had before saved a tiny bit of power
+  // but made connection establishment unreliable; phones could see the name
+  // (cached adv) but couldn't actually pair. Advertising automatically
+  // stops while connected, so the higher rate only applies when idle.
   struct ble_gap_adv_params adv_params = {
       .conn_mode = BLE_GAP_CONN_MODE_UND,
       .disc_mode = BLE_GAP_DISC_MODE_GEN,
-      .itvl_min = BLE_GAP_ADV_ITVL_MS(5000),
-      .itvl_max = BLE_GAP_ADV_ITVL_MS(5000),
+      .itvl_min = BLE_GAP_ADV_ITVL_MS(250),
+      .itvl_max = BLE_GAP_ADV_ITVL_MS(250),
   };
   rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, gap_event, NULL);
   if (rc != 0) ESP_LOGE(TAG, "ble_gap_adv_start: %d", rc);
