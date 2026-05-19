@@ -12,7 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "logmessage.pb.h"
-#include "nanopb/pb_encode.h"
+#include "pb_encode.h"
 #include "power_management.h"
 
 #define HEADROOM_BYTES (200 * 1024)

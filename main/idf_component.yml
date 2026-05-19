@@ -2,5 +2,8 @@
 dependencies:
   joltwallet/littlefs: "==1.9.2"
   espressif/esp-dsp: "^1.5.0"
+  livekit/nanopb: "==0.4.9"
+  esp-idf-lib/ds3231: "^1.0"
+  esp-idf-lib/i2cdev: "^2.0"
   idf:
     version: ">=5.4.0"

@@ -21,7 +21,7 @@ static const char* TAG = "ble_publisher";
 #include "freertos/semphr.h"
 #include "host/ble_hs.h"
 #include "host/util/util.h"
-#include "nanopb/pb_encode.h"
+#include "pb_encode.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "noise.pb.h"

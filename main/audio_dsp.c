@@ -14,7 +14,7 @@
 
 #include "esp_heap_caps.h"
 #include "heap_diag.h"
-#include "nanopb/pb_encode.h"
+#include "pb_encode.h"
 #include "power_management.h"
 
 static const char* TAG = "audio_dsp";
