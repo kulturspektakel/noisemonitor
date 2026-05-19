@@ -177,7 +177,6 @@ esp_err_t wifi_connect_set_credentials(const char* ssid, const char* password) {
   size_t pw_len   = strnlen(password, 64);
   if (ssid_len == 0 || ssid_len > 32 || pw_len > 63) return ESP_ERR_INVALID_ARG;
 
-  // 1. Persist to NVS so the new creds survive a reboot.
   nvs_handle_t h;
   esp_err_t err = nvs_open(NVS_DEVICE_CONFIG, NVS_READWRITE, &h);
   if (err != ESP_OK) return err;
@@ -187,21 +186,12 @@ esp_err_t wifi_connect_set_credentials(const char* ssid, const char* password) {
   nvs_close(h);
   if (err != ESP_OK) return err;
 
-  ESP_LOGI(WIFI_CONNECT_TASK, "new credentials stored; reconnecting to ssid=%s", ssid);
-
-  // Apply the new config to the driver immediately so the upcoming connect
-  // attempt uses it (esp_wifi_set_config is safe to call while running).
-  wifi_config_t cfg = {.sta = {.ssid = "", .password = ""}};
-  memcpy(cfg.sta.ssid,     ssid,     ssid_len);
-  memcpy(cfg.sta.password, password, pw_len);
-  esp_wifi_set_config(WIFI_IF_STA, &cfg);
-
-  // Drop the current association. The disconnect event handler installs a
-  // retry timer with a 2–5 min backoff; override it to fire ~immediately.
-  esp_wifi_disconnect();
-  vTaskDelay(pdMS_TO_TICKS(100));
-  if (update_timer != NULL) {
-    xTimerChangePeriod(update_timer, 1, 0);
-  }
-  return ESP_OK;
+  // Reboot to pick up the new creds. Reconnecting in-place is doable but
+  // requires re-applying wifi_config_t, overriding the retry timer, and
+  // dealing with the disconnect/connect event ordering — way more code
+  // surface for a path that runs maybe once per festival setup.
+  ESP_LOGI(WIFI_CONNECT_TASK, "new credentials stored; rebooting");
+  vTaskDelay(pdMS_TO_TICKS(200));  // give the BLE write-response a moment to land
+  esp_restart();
+  return ESP_OK;  // unreachable
 }

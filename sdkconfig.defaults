@@ -33,17 +33,23 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 # (At 1 the controller returned HCI 0x07 "Memory Capacity Exceeded" on
 # ble_gap_adv_start because no slot remained for the eventual connection.)
 CONFIG_BT_CTRL_BLE_MAX_ACT=2
-# NimBLE host mbuf pools (MSYS_1/MSYS_2). Defaults are sized for general use
-# (write-long, multi-connection GATT). Our characteristics are 1–3 bytes and
-# we accept exactly 1 client; halving both is safe.
-#  MSYS_1: 12 × 256 B = 3 KB  →  6 × 256 B = 1.5 KB (-1.5 KB)
-#  MSYS_2: 24 × 320 B = 7.7 KB →  12 × 320 B = 3.8 KB (-3.8 KB)
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
-# ACL data buffer pool: default 24 × 255 B = ~7 KB single contiguous alloc.
-# Our workload is 1 Hz notifications of 1–3 byte payloads, never bursting.
-# 4 buffers is plenty.
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4
+# NimBLE host mbuf + transport pools. Trimmed twice: first cut took defaults
+# down for a peripheral with one client (write-long, multi-connection sizing
+# isn't relevant here). Second cut (current values) was forced by the 30-min
+# Leq rings adding 7.2 KB of BSS — without it nimble_host_task xTaskCreate
+# silently failed with only ~2.5 KB largest contiguous heap remaining after
+# WiFi + DSP init, leaving BLE non-discoverable. Current sizes:
+#   MSYS_1: 4 × 256 B = 1 KB
+#   MSYS_2: 4 × 320 B = 1.25 KB
+#   ACL_FROM_LL: 2 × 255 B = ~0.5 KB
+#   EVT pool: 10 × 70 B + 4 × 70 B discardable = ~1 KB
+# Net delta vs first cut: -5 KB on the heap, enough to spawn host_task and
+# leave WiFi room to allocate its 6 RX buffers.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=4
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=2
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=10
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=4
 # We don't pair/bond.
 CONFIG_BT_NIMBLE_MAX_BONDS=0
 # NimBLE host task stack: our GAP/GATT callbacks are simple. 3 KB suffices.

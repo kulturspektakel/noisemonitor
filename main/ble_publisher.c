@@ -299,7 +299,7 @@ static void on_reset(int reason) {
 }
 
 static void host_task(void* param) {
-  nimble_port_run();   // blocks until nimble_port_stop()
+  nimble_port_run();  // blocks until nimble_port_stop()
   nimble_port_freertos_deinit();
 }
 
