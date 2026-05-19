@@ -2,6 +2,7 @@
 #include "audio_dsp.h"
 #include "calibration.h"
 #include "esp_log.h"
+#include "wifi_connect.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -40,10 +41,12 @@ static const char* TAG = "ble_publisher";
 static const ble_uuid128_t noise_svc_uuid  = NOISE_UUID_BASE(0x00);
 static const ble_uuid128_t chr_record_uuid = NOISE_UUID_BASE(0x01);
 static const ble_uuid128_t chr_cal_uuid    = NOISE_UUID_BASE(0x02);
+static const ble_uuid128_t chr_wifi_uuid   = NOISE_UUID_BASE(0x03);
 
 // Value handles filled by the stack at GATT registration.
 static uint16_t h_record = 0;
 static uint16_t h_cal    = 0;
+static uint16_t h_wifi   = 0;
 
 // Connection + subscription state.
 static volatile uint16_t curr_conn       = 0xffff;
@@ -71,6 +74,7 @@ static char serial_number[DEVICE_ID_LENGTH + 1];
 static int read_record(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 static int read_dis_string(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 static int access_cal(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
+static int write_wifi(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 
 // --- GATT service definition -------------------------------------------------
 static const struct ble_gatt_svc_def gatt_svcs[] = {
@@ -98,6 +102,11 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
       // CALIBRATED event bit (so the status LED turns green).
       { .uuid = &chr_cal_uuid.u, .access_cb = access_cal,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE, .val_handle = &h_cal },
+      // WiFi credentials, write-only. Payload format:
+      //   [u8 ssid_len][ssid bytes][u8 pw_len][pw bytes]
+      // ssid_len in 1..32, pw_len in 0..63 (0 = open network).
+      { .uuid = &chr_wifi_uuid.u, .access_cb = write_wifi,
+        .flags = BLE_GATT_CHR_F_WRITE, .val_handle = &h_wifi },
       { 0 },
     },
   },
@@ -152,6 +161,48 @@ static int access_cal(
     return 0;
   }
   return BLE_ATT_ERR_UNLIKELY;
+}
+
+static int write_wifi(
+    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
+) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_UNLIKELY;
+
+  // Pull the payload into a flat buffer. Max plausible size: 1 + 32 + 1 + 63 = 97.
+  uint8_t buf[128];
+  uint16_t total = OS_MBUF_PKTLEN(ctxt->om);
+  if (total < 2 || total > sizeof(buf)) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+  uint16_t copied = 0;
+  if (ble_hs_mbuf_to_flat(ctxt->om, buf, sizeof(buf), &copied) != 0 || copied != total) {
+    return BLE_ATT_ERR_UNLIKELY;
+  }
+
+  // Parse: [u8 ssid_len][ssid][u8 pw_len][pw]
+  uint8_t ssid_len = buf[0];
+  if (ssid_len < 1 || ssid_len > 32 || (size_t)(1 + ssid_len + 1) > total) {
+    return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+  }
+  uint8_t pw_len = buf[1 + ssid_len];
+  if (pw_len > 63 || (size_t)(1 + ssid_len + 1 + pw_len) != total) {
+    return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+  }
+
+  char ssid[33];
+  char password[64];
+  memcpy(ssid, buf + 1, ssid_len);
+  ssid[ssid_len] = '\0';
+  memcpy(password, buf + 1 + ssid_len + 1, pw_len);
+  password[pw_len] = '\0';
+
+  esp_err_t err = wifi_connect_set_credentials(ssid, password);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "wifi_connect_set_credentials: %s", esp_err_to_name(err));
+    return BLE_ATT_ERR_UNLIKELY;
+  }
+  // Log the SSID but not the password — keeping it out of the serial log
+  // matches the "never expose the password" goal of the write-only characteristic.
+  ESP_LOGI(TAG, "WiFi credentials set via BLE: ssid=%s (pw %u bytes)", ssid, pw_len);
+  return 0;
 }
 
 // --- GAP --------------------------------------------------------------------

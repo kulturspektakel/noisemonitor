@@ -88,13 +88,14 @@ message Record {
 }
 
 message NoiseRecording {
-  repeated Record records   = 2;   // 1 (MQTT/BLE live) or up to 300 (5-min file batch)
-  uint32 laeq_15m           = 3;   // sliding-window LAeq over last 15 min, same encoding
-  uint32 lceq_15m           = 4;   // sliding-window LCeq over last 15 min, same encoding
-  optional uint32 battery_mv = 5;  // only set on live (MQTT/BLE) when on battery
-                                   //  (omitted when USB is connected)
-  uint32 laeq_5m            = 6;   // sliding-window LAeq over last 5 min, same encoding
-  uint32 lceq_5m            = 7;   // sliding-window LCeq over last 5 min, same encoding
+  reserved 3, 4;                    // previously laeq_15m / lceq_15m
+
+  repeated Record records      = 2; // 1 (MQTT/BLE live) or up to 300 (5-min file batch)
+  optional uint32 battery_mv   = 5; // millivolts; only set on live messages when on battery
+  optional uint32 laeq_5m      = 6; // last 5 min (same encoding); only set when ring is full
+  optional uint32 lceq_5m      = 7;
+  optional uint32 laeq_30m     = 8; // last 30 min; only set when ring is full
+  optional uint32 lceq_30m     = 9;
 }
 ```
 
@@ -136,9 +137,13 @@ The 31 bands are **unweighted**, so downstream consumers (dashboards, server) ca
 
 **Use `laeq_1s` from the record for the headline dB(A) number.** Only re-derive from bands if you need a different weighting scheme.
 
-### `laeq_15m` / `lceq_15m` at the recording level
+### Sliding-window Leqs at the recording level
 
-`NoiseRecording.laeq_15m` and `lceq_15m` are sliding 15-minute Leqs from ring buffers the device maintains in RAM (`laeq_ring_15m[900]` / `lceq_ring_15m[900]` linear-energy values, ~3.6 KB each). Each MQTT/BLE message snapshots the current value; the file batch writer writes the values at the moment the batch is flushed. They're `uint8` (same 0.5 dB encoding as the per-second values) — consumers don't need to maintain their own 15-minute window across reconnects/drops.
+`NoiseRecording.laeq_5m / lceq_5m / laeq_30m / lceq_30m` are sliding Leqs over the last 5 and 30 minutes. They share a single 30-min ring buffer per channel (`laeq_ring[1800]` and `lceq_ring[1800]`, ~7.2 KB each); the 5-min window is computed by averaging the 300 most-recent entries of the same ring via `compute_leq_recent`.
+
+All four fields are `optional` and are **only set when the ring holds the full window of data** — 5-min fields appear after the device has been running 5+ minutes, 30-min fields after 30+ minutes. Below those thresholds the average would be over fewer samples than the field name implies, so the device omits them entirely (consumers see "missing" rather than misleading).
+
+Each MQTT/BLE message snapshots the current values; the file batch writer writes them when the batch is flushed. Consumers don't need to maintain their own sliding window across reconnects/drops.
 
 ---
 
@@ -146,9 +151,19 @@ The 31 bands are **unweighted**, so downstream consumers (dashboards, server) ca
 
 MQTT and BLE carry **the same bytes**: both publish the encoded `NoiseRecording` protobuf at 1 Hz, so a consumer app uses one decoder and picks whichever transport is reachable.
 
-### One characteristic
+### Characteristics
 
-A single notify-enabled `record` GATT characteristic (NimBLE peripheral, custom 128-bit UUID). Any longer-window aggregates the app wants (1 min, 30 min, anything else) it computes from the 1 Hz stream — the device itself only carries `laeq_15m`/`lceq_15m` because the per-second stream may be lossy and a 15-min window is the most useful single number to surface. Trade-off: a generic BLE scanner can't eyeball the dB number; the consumer app is the real client.
+NimBLE peripheral, custom 128-bit base UUID `7ed2f2c4-69e8-4f7c-9c93-7a3b1e5d0a00`. Three characteristics under it:
+
+| Suffix | Properties | Payload |
+|---|---|---|
+| `…0a01` `record`        | READ, NOTIFY | Encoded `NoiseRecording` protobuf (same bytes as MQTT). 1 Hz notify when subscribed. |
+| `…0a02` `cal_offset`    | READ, WRITE  | int32 LE, hundredths of dB. Persisted to NVS on write. |
+| `…0a03` `wifi_creds`    | WRITE only   | `[u8 ssid_len][ssid][u8 pw_len][pw]`. Persisted to NVS, triggers reconnect. Write-only on purpose — the password is never readable over BLE. |
+
+A generic BLE scanner can't eyeball the dB number from the `record` characteristic (it's protobuf bytes, not plaintext); the consumer app is the real client.
+
+The `wifi_creds` write happens in plaintext over BLE. We rely on physical proximity for security (~10 m BLE range, brief provisioning window). For stronger protection, switch the flag to `BLE_GATT_CHR_F_WRITE_ENC` and enable bonding — see the comment block in `ble_publisher.c`.
 
 ### Advertising and notify cadence
 

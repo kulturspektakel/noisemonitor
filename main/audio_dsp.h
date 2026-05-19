@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
@@ -32,14 +33,22 @@ esp_err_t audio_dsp_preinit(void);
 
 void audio_dsp(void* params);
 
-// Aggregate snapshots. Returns a uint8 in spec §5 encoding (= (dB - 20) * 2).
-// `*seconds_out` reports how many seconds of the window have actually been
-// observed (saturating at window size). Pass NULL if not needed.
-// 5- and 15-minute sliding windows. Both feed NoiseRecording.{laeq,lceq}_{5,15}m.
-uint8_t audio_dsp_get_laeq_5m(uint16_t* seconds_out);
-uint8_t audio_dsp_get_lceq_5m(uint16_t* seconds_out);
-uint8_t audio_dsp_get_laeq_15m(uint16_t* seconds_out);
-uint8_t audio_dsp_get_lceq_15m(uint16_t* seconds_out);
+// Snapshot of the sliding-window aggregates. Each value is a uint8 in
+// spec §5 encoding (= (dB - 20) * 2). `has_5m` / `has_30m` are true only
+// once the corresponding ring has fully populated, so callers can gate
+// emission without knowing the window sizes.
+typedef struct {
+  uint8_t laeq_5m;
+  uint8_t lceq_5m;
+  uint8_t laeq_30m;
+  uint8_t lceq_30m;
+  bool    has_5m;
+  bool    has_30m;
+} audio_dsp_aggregates_t;
+
+// Single-pass read of both 5m and 30m A/C-weighted Leqs from the shared
+// 30-min ring buffers.
+void audio_dsp_get_aggregates(audio_dsp_aggregates_t* out);
 
 // --- Shared record → protobuf helpers ----------------------------------------
 // Single source of truth for record_t → wire-format Record mapping. Use these

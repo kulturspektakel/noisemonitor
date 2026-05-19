@@ -5,8 +5,8 @@ NoiseRecording.Record.lafmax_1s       int_size:IS_8
 NoiseRecording.Record.lcfmax_1s       int_size:IS_8
 NoiseRecording.Record.lcpeak_1s       int_size:IS_8
 NoiseRecording.records                max_count:300
-NoiseRecording.laeq_15m               int_size:IS_8
-NoiseRecording.lceq_15m               int_size:IS_8
 NoiseRecording.laeq_5m                int_size:IS_8
 NoiseRecording.lceq_5m                int_size:IS_8
+NoiseRecording.laeq_30m               int_size:IS_8
+NoiseRecording.lceq_30m               int_size:IS_8
 NoiseRecording.battery_mv             int_size:IS_16

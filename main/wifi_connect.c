@@ -1,4 +1,5 @@
 #include "wifi_connect.h"
+#include <string.h>
 #include "constants.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -168,4 +169,39 @@ void wifi_connect(void* params) {
     esp_wifi_start();
     esp_wifi_connect();
   }
+}
+
+esp_err_t wifi_connect_set_credentials(const char* ssid, const char* password) {
+  if (ssid == NULL || password == NULL) return ESP_ERR_INVALID_ARG;
+  size_t ssid_len = strnlen(ssid, 33);
+  size_t pw_len   = strnlen(password, 64);
+  if (ssid_len == 0 || ssid_len > 32 || pw_len > 63) return ESP_ERR_INVALID_ARG;
+
+  // 1. Persist to NVS so the new creds survive a reboot.
+  nvs_handle_t h;
+  esp_err_t err = nvs_open(NVS_DEVICE_CONFIG, NVS_READWRITE, &h);
+  if (err != ESP_OK) return err;
+  err = nvs_set_str(h, NVS_WIFI_SSID, ssid);
+  if (err == ESP_OK) err = nvs_set_str(h, NVS_WIFI_PASSWORD, password);
+  if (err == ESP_OK) err = nvs_commit(h);
+  nvs_close(h);
+  if (err != ESP_OK) return err;
+
+  ESP_LOGI(WIFI_CONNECT_TASK, "new credentials stored; reconnecting to ssid=%s", ssid);
+
+  // Apply the new config to the driver immediately so the upcoming connect
+  // attempt uses it (esp_wifi_set_config is safe to call while running).
+  wifi_config_t cfg = {.sta = {.ssid = "", .password = ""}};
+  memcpy(cfg.sta.ssid,     ssid,     ssid_len);
+  memcpy(cfg.sta.password, password, pw_len);
+  esp_wifi_set_config(WIFI_IF_STA, &cfg);
+
+  // Drop the current association. The disconnect event handler installs a
+  // retry timer with a 2–5 min backoff; override it to fire ~immediately.
+  esp_wifi_disconnect();
+  vTaskDelay(pdMS_TO_TICKS(100));
+  if (update_timer != NULL) {
+    xTimerChangePeriod(update_timer, 1, 0);
+  }
+  return ESP_OK;
 }

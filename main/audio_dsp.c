@@ -43,8 +43,9 @@ static const char* TAG = "audio_dsp";
 #define FFT_SIZE 4096
 #define FFT_HOP  2048     // 50% overlap
 
-// --- Aggregate ring size — only 15-min sliding LAeq/LCeq are exposed ---------
-#define RING_15M 900
+// --- Aggregate ring size — 30 min holds enough seconds for 5-min and 30-min
+//     sliding-window Leq computations from the same buffer.
+#define RING_30M 1800
 
 // --- Center frequencies (Hz) per band, spec §5 --------------------------------
 static const float band_centers[NOISE_BANDS] = {
@@ -96,10 +97,11 @@ static int      fft_windows_in_second = 0;
 static int      broadband_samples_in_second = 0;
 static float    peak_abs_sample_in_second = 0.0f;
 
-// 15-min sliding LAeq/LCeq ring buffers (linear energies, not dB).
-static float    laeq_ring_15m[RING_15M];
-static float    lceq_ring_15m[RING_15M];
-static int      ring_idx_15m = 0;
+// 30-min sliding LAeq/LCeq ring buffers (linear energies, not dB).
+// Same buffers serve the 5-minute window via compute_leq_recent(..., 300).
+static float    laeq_ring[RING_30M];
+static float    lceq_ring[RING_30M];
+static int      ring_idx = 0;
 static int      total_seconds = 0;
 
 static uint32_t seq_no = 0;
@@ -334,48 +336,44 @@ static void run_fft_and_accumulate(void) {
 }
 
 // --- Aggregate ring helpers --------------------------------------------------
-// Average the most-recent `n` entries from a circular ring. `head` is the
-// next-write index, so the freshest entry is at (head-1+size)%size.
-static float compute_leq_recent(
-    const float* ring, int size, int head, int n
-) {
-  int valid = total_seconds < n ? total_seconds : n;
-  if (valid <= 0) return 0.0f;
-  double sum = 0.0;
-  for (int i = 1; i <= valid; i++) {
-    int idx = (head - i + size) % size;
-    sum += ring[idx];
-  }
-  if (sum <= 0.0) return 0.0f;
-  return 10.0f * log10f((float)(sum / (double)valid));
-}
-
 #define WINDOW_5M_SEC  300
-#define WINDOW_15M_SEC RING_15M
+#define WINDOW_30M_SEC RING_30M
 
-uint8_t audio_dsp_get_laeq_5m(uint16_t* sec_out) {
-  int valid = total_seconds < WINDOW_5M_SEC ? total_seconds : WINDOW_5M_SEC;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(
-      compute_leq_recent(laeq_ring_15m, RING_15M, ring_idx_15m, WINDOW_5M_SEC));
+// Walk the 30-min ring once, accumulating both the last-300-entry sum
+// (5-min window) and the last-1800-entry sum (30-min window). Halves the
+// per-second cost vs. two independent passes.
+static void leq_pair_sum(const float* ring, int head,
+                        double* sum_5m, double* sum_30m) {
+  double s5 = 0.0, s30 = 0.0;
+  int n5  = total_seconds < WINDOW_5M_SEC  ? total_seconds : WINDOW_5M_SEC;
+  int n30 = total_seconds < WINDOW_30M_SEC ? total_seconds : WINDOW_30M_SEC;
+  for (int i = 1; i <= n30; i++) {
+    int idx = (head - i + RING_30M) % RING_30M;
+    float v = ring[idx];
+    s30 += v;
+    if (i <= n5) s5 += v;
+  }
+  *sum_5m  = s5;
+  *sum_30m = s30;
 }
-uint8_t audio_dsp_get_lceq_5m(uint16_t* sec_out) {
-  int valid = total_seconds < WINDOW_5M_SEC ? total_seconds : WINDOW_5M_SEC;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(
-      compute_leq_recent(lceq_ring_15m, RING_15M, ring_idx_15m, WINDOW_5M_SEC));
+
+static uint8_t leq_from_sum(double sum, int n) {
+  if (n <= 0 || sum <= 0.0) return 0;
+  return encode_db_to_byte(10.0f * log10f((float)(sum / (double)n)));
 }
-uint8_t audio_dsp_get_laeq_15m(uint16_t* sec_out) {
-  int valid = total_seconds < WINDOW_15M_SEC ? total_seconds : WINDOW_15M_SEC;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(
-      compute_leq_recent(laeq_ring_15m, RING_15M, ring_idx_15m, WINDOW_15M_SEC));
-}
-uint8_t audio_dsp_get_lceq_15m(uint16_t* sec_out) {
-  int valid = total_seconds < WINDOW_15M_SEC ? total_seconds : WINDOW_15M_SEC;
-  if (sec_out) *sec_out = (uint16_t)valid;
-  return encode_db_to_byte(
-      compute_leq_recent(lceq_ring_15m, RING_15M, ring_idx_15m, WINDOW_15M_SEC));
+
+void audio_dsp_get_aggregates(audio_dsp_aggregates_t* out) {
+  double a5, a30, c5, c30;
+  leq_pair_sum(laeq_ring, ring_idx, &a5, &a30);
+  leq_pair_sum(lceq_ring, ring_idx, &c5, &c30);
+  int n5  = total_seconds < WINDOW_5M_SEC  ? total_seconds : WINDOW_5M_SEC;
+  int n30 = total_seconds < WINDOW_30M_SEC ? total_seconds : WINDOW_30M_SEC;
+  out->laeq_5m  = leq_from_sum(a5,  n5);
+  out->lceq_5m  = leq_from_sum(c5,  n5);
+  out->laeq_30m = leq_from_sum(a30, n30);
+  out->lceq_30m = leq_from_sum(c30, n30);
+  out->has_5m   = (n5  >= WINDOW_5M_SEC);
+  out->has_30m  = (n30 >= WINDOW_30M_SEC);
 }
 
 // --- Shared record → protobuf helpers ----------------------------------------
@@ -397,26 +395,31 @@ size_t record_encode_single(const record_t* r, uint8_t* out, size_t cap) {
   NoiseRecording_Record sub;
   record_to_pb(r, &sub);
 
+  audio_dsp_aggregates_t agg;
+  audio_dsp_get_aggregates(&agg);
+
   pb_ostream_t stream = pb_ostream_from_buffer(out, cap);
-  // Field 2: repeated NoiseRecording.Record records (= one Record)
   if (!pb_encode_tag(&stream, PB_WT_STRING, 2)) goto fail;
   if (!pb_encode_submessage(&stream, NoiseRecording_Record_fields, &sub)) goto fail;
-  // Field 3: laeq_15m (uint32 varint)
-  if (!pb_encode_tag(&stream, PB_WT_VARINT, 3)) goto fail;
-  if (!pb_encode_varint(&stream, audio_dsp_get_laeq_15m(NULL))) goto fail;
-  // Field 4: lceq_15m (uint32 varint)
-  if (!pb_encode_tag(&stream, PB_WT_VARINT, 4)) goto fail;
-  if (!pb_encode_varint(&stream, audio_dsp_get_lceq_15m(NULL))) goto fail;
-  // Field 6: laeq_5m, Field 7: lceq_5m
-  if (!pb_encode_tag(&stream, PB_WT_VARINT, 6)) goto fail;
-  if (!pb_encode_varint(&stream, audio_dsp_get_laeq_5m(NULL))) goto fail;
-  if (!pb_encode_tag(&stream, PB_WT_VARINT, 7)) goto fail;
-  if (!pb_encode_varint(&stream, audio_dsp_get_lceq_5m(NULL))) goto fail;
-  // Field 5: battery_mv (optional) — omitted when USB is connected, since
-  // the battery voltage reading isn't meaningful while charging.
+
+  // battery_mv is only meaningful off-USB; skip when charging.
   if (usb_voltage <= 1000 && battery_voltage > 0) {
     if (!pb_encode_tag(&stream, PB_WT_VARINT, 5)) goto fail;
     if (!pb_encode_varint(&stream, (uint64_t)battery_voltage)) goto fail;
+  }
+  // 5m/30m windows are emitted only when their ring is fully populated —
+  // a partial average would be over fewer seconds than the field name implies.
+  if (agg.has_5m) {
+    if (!pb_encode_tag(&stream, PB_WT_VARINT, 6)) goto fail;
+    if (!pb_encode_varint(&stream, agg.laeq_5m))  goto fail;
+    if (!pb_encode_tag(&stream, PB_WT_VARINT, 7)) goto fail;
+    if (!pb_encode_varint(&stream, agg.lceq_5m))  goto fail;
+  }
+  if (agg.has_30m) {
+    if (!pb_encode_tag(&stream, PB_WT_VARINT, 8)) goto fail;
+    if (!pb_encode_varint(&stream, agg.laeq_30m)) goto fail;
+    if (!pb_encode_tag(&stream, PB_WT_VARINT, 9)) goto fail;
+    if (!pb_encode_varint(&stream, agg.lceq_30m)) goto fail;
   }
   return stream.bytes_written;
 fail:
@@ -469,13 +472,13 @@ static void emit_per_second(void) {
   EventBits_t bits = xEventGroupGetBits(event_group);
   bool time_set = (bits & TIME_SET) != 0;
 
-  // Update the 15-min sliding rings (linear energy).
+  // Update the 30-min sliding rings (linear energy).
   float laeq_lin = (float)pow(10.0, laeq_db / 10.0);
   float lceq_lin = (float)pow(10.0, lceq_db / 10.0);
-  laeq_ring_15m[ring_idx_15m] = laeq_lin;
-  lceq_ring_15m[ring_idx_15m] = lceq_lin;
-  ring_idx_15m = (ring_idx_15m + 1) % RING_15M;
-  if (total_seconds < RING_15M) total_seconds++;
+  laeq_ring[ring_idx] = laeq_lin;
+  lceq_ring[ring_idx] = lceq_lin;
+  ring_idx = (ring_idx + 1) % RING_30M;
+  if (total_seconds < RING_30M) total_seconds++;
 
   if (time_set) {
     record_t r = { 0 };

@@ -106,10 +106,16 @@ static void flush_to_file(void) {
   log_message_buf.usb_voltage = usb_voltage;
   log_message_buf.has_noise_recording = true;
   log_message_buf.noise_recording.records_count = records_count;
-  log_message_buf.noise_recording.laeq_15m = audio_dsp_get_laeq_15m(NULL);
-  log_message_buf.noise_recording.lceq_15m = audio_dsp_get_lceq_15m(NULL);
-  log_message_buf.noise_recording.laeq_5m  = audio_dsp_get_laeq_5m(NULL);
-  log_message_buf.noise_recording.lceq_5m  = audio_dsp_get_lceq_5m(NULL);
+  audio_dsp_aggregates_t agg;
+  audio_dsp_get_aggregates(&agg);
+  log_message_buf.noise_recording.has_laeq_5m  = agg.has_5m;
+  log_message_buf.noise_recording.has_lceq_5m  = agg.has_5m;
+  log_message_buf.noise_recording.laeq_5m      = agg.laeq_5m;
+  log_message_buf.noise_recording.lceq_5m      = agg.lceq_5m;
+  log_message_buf.noise_recording.has_laeq_30m = agg.has_30m;
+  log_message_buf.noise_recording.has_lceq_30m = agg.has_30m;
+  log_message_buf.noise_recording.laeq_30m     = agg.laeq_30m;
+  log_message_buf.noise_recording.lceq_30m     = agg.lceq_30m;
 
   ensure_free_space();
 
