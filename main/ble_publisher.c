@@ -352,6 +352,11 @@ void ble_publisher(void* params) {
   ble_svc_gap_device_name_set(adv_name);
   nimble_port_freertos_init(host_task);
 
+  // Release wifi_connect; it waits on BLE_HOST_READY so WiFi init can't
+  // steal the contiguous DMA-internal heap the BLE controller needs for
+  // HCI command processing (set_advertising_data was hitting ENOMEM in
+  // the controller's malloc_internal_wrapper otherwise).
+  xEventGroupSetBits(event_group, BLE_HOST_READY);
   ESP_LOGI(TAG, "BLE peripheral up; advertising as %s", adv_name);
 
   // Drain loop: encode each per-second record as the same protobuf bytes the

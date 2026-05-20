@@ -80,9 +80,9 @@ CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
 # trim them to our actual workload: 1 Hz MQTT publish, occasional HTTPS
 # upload, 1 BLE client. Frees enough heap that WiFi + BLE init succeed
 # without malloc fails after the FFT table is allocated.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=8
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
 # mbedtls SSL session buffers. Defaults are 16384 each (32 KB total per
