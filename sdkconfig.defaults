@@ -52,8 +52,11 @@ CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=10
 CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=4
 # We don't pair/bond.
 CONFIG_BT_NIMBLE_MAX_BONDS=0
-# NimBLE host task stack: our GAP/GATT callbacks are simple. 3 KB suffices.
-CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=3072
+# NimBLE host task stack. 3 KB was too tight — the GAP disconnect event
+# handler chain inside NimBLE overflowed the stack ("stack overflow in
+# task nimble_host" → CPU reset) every time a connected client went away.
+# 4 KB is the IDF default and clears it with margin.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
 
 # Stop the WiFi driver from writing NVS after a station connection. The post-
 # connect NVS commit briefly disables dcache, and mbedtls handshake code

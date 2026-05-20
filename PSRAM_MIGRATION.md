@@ -129,15 +129,7 @@ as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
 - **Revert (option B):** Go back to `calloc` (in PSRAM), free after flush.
 - **Benefit:** Dynamic sizing if `RECORDS_PER_FILE` changes later.
 
-### 10. NimBLE host task stack 4096 → 3072
-- **Where:** `sdkconfig.defaults:56` (`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE`)
-- **What:** Trimmed from default 4096 to 3072 to save 1 KB heap.
-- **Why:** Every byte counted.
-- **Revert:** Restore 4096. Task stacks must stay in internal RAM (FreeRTOS
-  doesn't put them in PSRAM), but +1 KB internal is irrelevant with PSRAM.
-- **Benefit:** Headroom for any future GAP/GATT callback complexity.
-
-### 11. WiFi RX/TX buffer counts
+### 10. WiFi RX/TX buffer counts
 - **Where:** `sdkconfig.defaults:83-85`
 - **What:**
   - `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6`
@@ -192,7 +184,7 @@ These are correct/legitimate decisions independent of heap pressure. Do
    preinit hook, BLE_HOST_READY ordering bit). Highest code-complexity
    wins.
 
-3. **Commit 3 — config restorations:** items 5, 6, 7, 8, 10, 11. All
+3. **Commit 3 — config restorations:** items 5, 6, 7, 8, 10. All
    sdkconfig knobs back near defaults.
 
 4. **Optional later — item 3:** radix-4 FFT. Measure DSP utilization
