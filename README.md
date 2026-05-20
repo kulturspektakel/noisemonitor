@@ -197,17 +197,12 @@ The DSP outputs raw FFT magnitudes in arbitrary units. A calibration offset (`in
 
 ### Setting calibration
 
-**Preferred (when USB console input works):** from a serial monitor connected at 115200 baud,
-
-```
-CAL_SET 5150     # sets offset to +51.50 dB
-CAL_GET          # reads back current offset
-CAL_CLEAR        # erases NVS, clears CALIBRATED bit
-```
-
-These are handled by `cal_console.c` reading USB-Serial-JTAG stdin.
-
-**Fallback (when console input doesn't reach the device):** there is a `calibration_set(5150)` call in `main.c` right after `calibration_init()` that forces the offset on every boot. Edit the constant, rebuild, flash. Remove the call once `CAL_SET` over USB works for you. (We hit a macOS-specific issue where short-lived writes to `/dev/cu.usbmodem*` didn't reach the firmware's `fgets()` on stdin.)
+Calibration is done over BLE via the GATT characteristic at UUID `…0a02`
+(int32-LE, signed hundredths of a dB). The `crew/lautstaerke` page on the
+companion website exposes "Kalibrierung…" in the connected-device menu,
+which reads the current offset, prompts for a new value, and writes it
+back. The firmware persists the offset to NVS and sets the `CALIBRATED`
+event bit.
 
 ### Calibration procedure
 
@@ -215,7 +210,7 @@ These are handled by `cal_console.c` reading USB-Serial-JTAG stdin.
 2. Co-locate the device mic and an SPL meter (phone app like Decibel X is fine, ±2 dB).
 3. Note reference dB(A) on the phone, e.g. 75.0.
 4. Read the LAeq from the device's MQTT log line ("published seq=N LAeq=X.X dB(A)") — that's the decoded byte (0.5 dB resolution).
-5. Compute `(reference − device_LAeq) × 100` → send `CAL_SET <result>`.
+5. Compute `reference − device_LAeq` and enter that dB delta in the website's "Kalibrierung…" prompt.
 6. Verify: phone and device should now match within ~1 dB at 1 kHz.
 
 For frequency response verification, switch from sine to **pink noise** — it averages cleanly across all bands and matches what real music spectrally looks like.
@@ -275,22 +270,9 @@ Most of these compromises go away once the **ESP32-S3-N16R2 (2 MB PSRAM)** board
 
 ## Known gotchas
 
-- **USB-Serial-JTAG input:** writes from `printf > /dev/cu.usbmodem*` on macOS don't reliably reach the firmware's `fgets()` on stdin. Use an interactive terminal session (`idf.py monitor` or `screen`) for `CAL_SET`, or the boot-time `calibration_set()` fallback in `main.c`.
 - **esp-dsp SIMD FFT bug:** always use `_ansi` variants, even though they're slightly slower. See "Why the ANSI FFT" above.
 - **Calibration offset is hardware-specific.** Each device + mic combo needs its own offset. NVS stores it per-device.
 - **LAFmax / LCFmax / LCpeak are pragmatic approximations.** Proper IEC 61672 Fast time-weighting wants an exponential smoother with τ=125 ms on time-domain weighted samples. We instead take the max single-FFT A/C-weighted energy across the second (~85 ms FFT window ≈ Fast response). LCpeak is the unweighted absolute sample peak (not C-weighted in the time domain). Adequate for festival trending; not Type-1 SLM lab-grade.
-
----
-
-## Console commands
-
-Over USB-Serial-JTAG, 115200 baud:
-
-| Command | Effect |
-|---|---|
-| `CAL_SET <offset_x100>` | Set calibration offset (dB × 100). Persists to NVS. Sets CALIBRATED event bit. |
-| `CAL_GET` | Print current offset, or `uncalibrated` if not set. |
-| `CAL_CLEAR` | Erase NVS, zero in-RAM offset, clear CALIBRATED bit. |
 
 ---
 
@@ -301,9 +283,8 @@ Over USB-Serial-JTAG, 115200 baud:
 | `main/main.c` | Task spawn + queue setup + LittleFS mount |
 | `main/audio_dsp.c` | I²S read, FFT, per-bin A-weighting, band aggregation, record emission, shared `record_to_pb` / `record_encode_single` helpers |
 | `main/calibration.c` | NVS persistence of cal offset, event bit management |
-| `main/cal_console.c` | USB-Serial-JTAG line parser for CAL_* commands |
 | `main/mqtt_publisher.c` | Protobuf encode + publish to MQTT broker |
-| `main/ble_publisher.c` | NimBLE GATT server — single `record` notify characteristic, same protobuf as MQTT |
+| `main/ble_publisher.c` | NimBLE GATT server — record-notify, calibration read/write, WiFi credential write |
 | `main/record_writer.c` | Buffer records to LittleFS in 300-record (5-min) log files |
 | `main/log_uploader.c` | HTTPS upload of completed log files |
 | `NOISE_MONITOR_SPEC.md` | Original product spec — what we're building and why |

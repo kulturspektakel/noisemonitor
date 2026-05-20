@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include "audio_dsp.h"
 #include "ble_publisher.h"
-#include "cal_console.h"
 #include "calibration.h"
 #include "constants.h"
 #include "driver/gpio.h"
@@ -88,7 +87,6 @@ void app_main(void) {
 
   // New
   xTaskCreate(&mqtt_publisher,   "mqtt_publisher",      4096, NULL, TASK_PRIO_NORMAL, NULL);
-  xTaskCreate(&cal_console,      "cal_console",         3072, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&ble_publisher,    "ble_publisher",       4096, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&status_led,       "status_led",          2048, NULL, TASK_PRIO_NORMAL, NULL);
 
