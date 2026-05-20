@@ -33,10 +33,19 @@ static void mqtt_event_handler(
     case MQTT_EVENT_CONNECTED:
       ESP_LOGI(TAG, "MQTT connected");
       mqtt_connected = true;
+      xEventGroupSetBits(event_group, MQTT_CONNECTED);
+      // Kick log_uploader so it retries any backlog whose first attempt
+      // missed because mbedtls couldn't allocate while MQTT was still
+      // setting up its own TLS.
+      {
+        TaskHandle_t h = xTaskGetHandle(LOG_UPLOADER_TASK);
+        if (h) xTaskNotify(h, 0, eNoAction);
+      }
       break;
     case MQTT_EVENT_DISCONNECTED:
       ESP_LOGI(TAG, "MQTT disconnected");
       mqtt_connected = false;
+      xEventGroupClearBits(event_group, MQTT_CONNECTED);
       break;
     case MQTT_EVENT_ERROR:
       ESP_LOGW(TAG, "MQTT error");

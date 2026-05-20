@@ -150,8 +150,15 @@ void log_uploader(void* params) {
     log_files_to_upload += increment;
     xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
 
-    bool wifi_connected = xEventGroupGetBits(event_group) & WIFI_CONNECTED;
-    if (log_files_to_upload == 0 || !wifi_connected) {
+    // Gate on MQTT being up, not just WiFi: at boot MQTT's TLS handshake
+    // grabs a contiguous mbedtls IN+OUT buffer pair (~8 KB), and if we
+    // start our own HTTPS handshake at the same instant the second
+    // mbedtls_ssl_setup hits MBEDTLS_ERR_SSL_ALLOC_FAILED. Once MQTT is
+    // connected it holds those buffers steadily; the heap shape is
+    // predictable and our handshake finds the contiguous chunk it needs.
+    bool ready = (xEventGroupGetBits(event_group) & (WIFI_CONNECTED | MQTT_CONNECTED))
+                 == (WIFI_CONNECTED | MQTT_CONNECTED);
+    if (log_files_to_upload == 0 || !ready) {
       continue;
     }
 
