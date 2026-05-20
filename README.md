@@ -25,7 +25,7 @@ INMP441 (I²S mic) ──► I²S RX peripheral ──► audio_dsp task
                                                                   └─► record_writer (LittleFS)
 ```
 
-Records go out every second containing 31 band values + 5 weighted summary metrics. The 15-minute sliding LAeq/LCeq aggregates are computed from in-RAM ring buffers and attached to every `NoiseRecording` message.
+Records go out every second containing 31 band values + 5 weighted summary metrics. The 5-minute sliding LAeq/LCeq aggregates are computed from in-RAM ring buffers and attached to every `NoiseRecording` message. (The protobuf also reserves optional `laeq_30m` / `lceq_30m` fields; they go live once the device runs on PSRAM — see [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md).)
 
 ---
 
@@ -139,9 +139,11 @@ The 31 bands are **unweighted**, so downstream consumers (dashboards, server) ca
 
 ### Sliding-window Leqs at the recording level
 
-`NoiseRecording.laeq_5m / lceq_5m / laeq_30m / lceq_30m` are sliding Leqs over the last 5 and 30 minutes. They share a single 30-min ring buffer per channel (`laeq_ring[1800]` and `lceq_ring[1800]`, ~7.2 KB each); the 5-min window is computed by averaging the 300 most-recent entries of the same ring via `compute_leq_recent`.
+`NoiseRecording.laeq_5m / lceq_5m / laeq_30m / lceq_30m` are sliding Leqs over the last 5 and 30 minutes. They share a single ring buffer per channel (`laeq_ring[RING_30M]` and `lceq_ring[RING_30M]`); a single-pass walk via `audio_dsp_get_aggregates` accumulates both window sums at once.
 
-All four fields are `optional` and are **only set when the ring holds the full window of data** — 5-min fields appear after the device has been running 5+ minutes, 30-min fields after 30+ minutes. Below those thresholds the average would be over fewer samples than the field name implies, so the device omits them entirely (consumers see "missing" rather than misleading).
+**Current state (no-PSRAM board): `RING_30M = 300`**, so only the 5-min window is populated. `WINDOW_30M_SEC` is intentionally pinned at 1800 so `has_30m` stays false and the 30-min fields stay unset — the website renders them as gaps. Bumping `RING_30M` to 1800 (one-line change in `audio_dsp.c`) re-enables the 30-min average; defer until the ESP32-S3-N16R2 board lands so we have the BSS headroom. See [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md).
+
+All four fields are `optional` and are **only set when the ring holds the full window of data** — 5-min fields appear after the device has been running 5+ minutes; below that threshold the average would be over fewer samples than the field name implies, so the device omits them entirely (consumers see "missing" rather than misleading).
 
 Each MQTT/BLE message snapshots the current values; the file batch writer writes them when the batch is flushed. Consumers don't need to maintain their own sliding window across reconnects/drops.
 
@@ -235,7 +237,7 @@ idf.py -p /dev/cu.usbmodem* flash monitor
 
 ## Memory tuning
 
-The ESP32-S3 has 320 KB SRAM, no PSRAM, and we run audio DSP + WiFi + BLE + MQTT + LittleFS concurrently. The heap gets aggressively fragmented during driver init — by the time tasks are running, the **largest contiguous free chunk drops to ~4 KB** even when 7+ KB total is free. So we don't fight fragmentation directly; we keep large buffers either in BSS (static, link-time reserved, never on heap) or pre-allocated very early.
+The ESP32-S3 has 320 KB SRAM, no PSRAM, and we run audio DSP + WiFi + BLE + MQTT + LittleFS concurrently. The heap gets aggressively fragmented during driver init — by the time tasks are running, the **largest contiguous free chunk hovers around 8 KB** even when 20+ KB total is free. So we don't fight fragmentation directly; we keep large buffers either in BSS (static, link-time reserved, never on heap) or pre-allocated very early.
 
 | Large buffer | Strategy | Reason |
 |---|---|---|
@@ -244,14 +246,23 @@ The ESP32-S3 has 320 KB SRAM, no PSRAM, and we run audio DSP + WiFi + BLE + MQTT
 | A/C per-bin weight tables (8 KB each) | Static (BSS) in `audio_dsp.c` | One-time compute at init, never reallocated |
 | FFT work buffer (32 KB), Hann | Static (BSS) in `audio_dsp.c` | Hot-path buffers, no allocation churn |
 
-To make the MQTT client fit in the post-init heap, three of its config knobs are tightened from defaults:
-- `cfg.buffer.size = 256` (default 1024) — our messages are 50-100 bytes encoded
-- `cfg.buffer.out_size = 256` (default 1024)
-- `cfg.task.stack_size = 3584` (default 6144) — the MQTT task loop is tight at our message sizes
+Three further tunings are needed to coexist with WiFi + BLE in the remaining heap:
+
+- **BLE-first startup order.** `wifi_connect` waits on the `BLE_HOST_READY` event-group bit before initializing. If WiFi runs first it consumes ~110 KB and the BLE controller's runtime DMA-internal allocations later fail (`set_advertising_data` returns `BLE_ERR_MEM_CAPACITY` and the device becomes silently undiscoverable).
+- **NimBLE pool trims** in `sdkconfig.defaults`: `MSYS_1/MSYS_2_BLOCK_COUNT`, `TRANSPORT_ACL_FROM_LL_COUNT`, `TRANSPORT_EVT_COUNT`, `TRANSPORT_EVT_DISCARD_COUNT` all cut well below defaults.
+- **MQTT client config** is tightened from defaults:
+  - `cfg.buffer.size = 256` (default 1024) — our messages are 50-100 bytes encoded
+  - `cfg.buffer.out_size = 256` (default 1024)
+  - `cfg.task.stack_size = 3072` (default 6144) — the MQTT task loop is tight at our message sizes
+- **mbedtls SSL buffers** shrunk to 4096 (default 16384) and **LWIP TCP windows** shrunk to 2880 (default 5760).
 
 The I²S driver is also tuned for smaller DMA descriptors (`dma_desc_num=4, dma_frame_num=120`) — ~2.5 ms DMA window, well under our 21 ms read cadence, saves a few KB.
 
-**If you add anything that takes a contiguous heap chunk > ~4 KB at runtime, it will fail.** Either preinit-allocate it (like the FFT table), put it in BSS (like LogMessage), or rework it to stream.
+The 5-min sliding-window ring buffers (`RING_30M = 300` per channel, 2.4 KB BSS) replaced an earlier 30-min ring (1800, 14.4 KB BSS) for the same heap reason. The 30-min protobuf fields are reserved but unset.
+
+**If you add anything that takes a contiguous heap chunk > ~8 KB at runtime, it will fail.** Either preinit-allocate it (like the FFT table), put it in BSS (like LogMessage), or rework it to stream.
+
+Most of these compromises go away once the **ESP32-S3-N16R2 (2 MB PSRAM)** board arrives. See [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md) for the per-item revert plan.
 
 ---
 
