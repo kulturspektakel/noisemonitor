@@ -9,6 +9,21 @@ internal SRAM. Once the PSRAM board lands, walk this list top-to-bottom and
 unwind the items in **Section 1**. The items in **Section 2** are not
 memory-driven and should stay.
 
+## TL;DR — the one-line revert to get the 30-min average back
+
+`main/audio_dsp.c`:
+
+```c
+#define RING_30M 300    // <-- bump to 1800 when PSRAM is available
+```
+
+The 30-min window is currently shrunk to a 5-min ring (300 entries) to fit
+the no-PSRAM heap budget. `WINDOW_30M_SEC` is intentionally decoupled from
+`RING_30M` and pinned at 1800, so `has_30m` stays false and the
+`laeq_30m` / `lceq_30m` proto fields stay unset (the website renders them
+as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
+30-min average with no other code change.
+
 ## Section 1 — Revert with PSRAM
 
 ### 1. `record_encode_single` stream-encoder

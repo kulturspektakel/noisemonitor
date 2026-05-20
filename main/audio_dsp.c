@@ -45,7 +45,14 @@ static const char* TAG = "audio_dsp";
 
 // --- Aggregate ring size — 30 min holds enough seconds for 5-min and 30-min
 //     sliding-window Leq computations from the same buffer.
-#define RING_30M 1800
+// Ring size for the sliding-window aggregates. Sized for 5-min on the
+// no-PSRAM board (300 entries × 2 channels × 4 B = 2.4 KB BSS). The 30-min
+// window stays defined at 1800 seconds below, so has_30m never goes true
+// while RING_30M < 1800 — the laeq_30m / lceq_30m proto fields stay unset
+// and the website renders them as gaps. When the PSRAM board arrives,
+// change this back to 1800 to re-enable the 30-min average. One-line
+// revert — see PSRAM_MIGRATION.md.
+#define RING_30M 300
 
 // --- Center frequencies (Hz) per band, spec §5 --------------------------------
 static const float band_centers[NOISE_BANDS] = {
@@ -337,7 +344,7 @@ static void run_fft_and_accumulate(void) {
 
 // --- Aggregate ring helpers --------------------------------------------------
 #define WINDOW_5M_SEC  300
-#define WINDOW_30M_SEC RING_30M
+#define WINDOW_30M_SEC 1800
 
 // Walk the 30-min ring once, accumulating both the last-300-entry sum
 // (5-min window) and the last-1800-entry sum (30-min window). Halves the
