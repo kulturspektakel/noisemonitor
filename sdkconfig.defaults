@@ -95,12 +95,12 @@ CONFIG_LWIP_TCP_WND_DEFAULT=2880
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
 
-# Power management — dynamic frequency scaling + auto light-sleep between
-# task activations. esp_pm_configure() in main.c sets the actual ceiling and
-# floor. Tickless idle lets FreeRTOS skip ticks while sleeping. I²S/BLE/WiFi
-# drivers acquire PM locks while busy so stream and timing are preserved.
+# Power management — dynamic frequency scaling only. Light sleep is off
+# (esp_pm_configure() in main.c sets light_sleep_enable=false): continuous
+# I²S RX + 100 %-utilized DSP task on Core 1 hold PM locks that prevent the
+# kernel from ever finding an "all cores idle" window. DFS still kicks in
+# whenever no PM lock is held and is the only real saving here.
 CONFIG_PM_ENABLE=y
-CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 
 # Allow time_sync to query multiple NTP servers in one shot. Single-server
 # default (pool.ntp.org) failed reliably on phone hotspots and some Wi-Fi

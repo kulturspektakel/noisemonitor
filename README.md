@@ -263,10 +263,10 @@ Most of these compromises go away once the **ESP32-S3-N16R2 (2 MB PSRAM)** board
 
 ## Power management
 
-- **Dynamic frequency scaling enabled**: `esp_pm_configure()` in `app_main` sets max 160 MHz, min 40 MHz, with automatic light-sleep. CPU scales down to 40 MHz between FFT bursts and radio activity.
+- **Dynamic frequency scaling enabled**: `esp_pm_configure()` in `app_main` sets max 160 MHz, min 40 MHz. CPU scales down to 40 MHz between FFT bursts and radio activity. This is the only PM mode that actually fires.
+- **Light sleep disabled** (`light_sleep_enable = false`): with continuous I²S RX + a Core 1 DSP task at ~100 % utilization, the kernel never finds an "all cores idle" window. The I²S driver also holds an APB-freq PM lock as long as its RX channel is enabled. Enabling light sleep would just produce the `BLE_INIT: light sleep mode will not be ...` boot warning and never actually save anything.
 - **WiFi modem sleep**: `WIFI_PS_MIN_MODEM` activated after STA gets IP. Saves significant idle WiFi current; MQTT publishes still work with a few ms latency on incoming packets. Fall back to `WIFI_PS_NONE` if the AP drops idle clients (some phone hotspots do).
-- **Light sleep limitation**: BLE controller blocks light sleep while active (you'll see `BLE_INIT: light sleep mode will not be ...` at boot). DFS still saves power; light sleep activates when no BLE peer is connected.
-- **Tickless idle enabled**: FreeRTOS skips ticks during idle/sleep.
+- **BLE modem sleep**: with `BLE_GAP_ADV_ITVL_MS(1000)` the controller spends most of the time between advertising bursts with the radio off.
 
 ## Known gotchas
 

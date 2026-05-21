@@ -111,6 +111,14 @@ static float    lceq_ring[RING_30M];
 static int      ring_idx = 0;
 static int      total_seconds = 0;
 
+// Pre-computed Hann window. The original code computed this on the fly
+// (cosf in the FFT inner loop). cosf lives in newlib (flash); during a
+// record_writer flash erase, the cache-disabled window resolves cosf to
+// a bogus address and the audio_dsp task panics on the next FFT. Caching
+// the window in BSS keeps the hot path entirely off flash for this term,
+// and also saves ~9 ms/sec of CPU.
+static float    hann_window[FFT_SIZE];
+
 static uint32_t seq_no = 0;
 
 #if SIMULATE_MIC
@@ -269,6 +277,11 @@ static void dsp_init(void) {
   }
   compute_band_edges();
   compute_bin_weights();
+
+  const float hann_k = 2.0f * (float)M_PI / (float)FFT_SIZE;
+  for (int i = 0; i < FFT_SIZE; i++) {
+    hann_window[i] = 0.5f * (1.0f - cosf((float)i * hann_k));
+  }
 }
 
 // --- Conversion helpers -----------------------------------------------------
@@ -282,14 +295,12 @@ static uint8_t encode_db_to_byte(float db) {
 
 // --- FFT execution: pulls FFT_SIZE samples from fft_ring (oldest-first) ----
 static void run_fft_and_accumulate(void) {
-  // Copy fft_ring into fft_work as complex pairs (real, 0), applying Hann on
-  // the fly (saves 16 KB vs. a precomputed table; ~9 ms/sec of cosf calls).
-  // fft_ring is circular; oldest sample is at fft_ring_head.
-  const float hann_k = 2.0f * (float)M_PI / (float)FFT_SIZE;
+  // Copy fft_ring into fft_work as complex pairs (real, 0), applying the
+  // pre-computed Hann window. fft_ring is circular; oldest sample is at
+  // fft_ring_head.
   for (int i = 0; i < FFT_SIZE; i++) {
     int idx = (fft_ring_head + i) % FFT_SIZE;
-    float h = 0.5f * (1.0f - cosf((float)i * hann_k));
-    fft_work[2 * i]     = fft_ring[idx] * h;
+    fft_work[2 * i]     = fft_ring[idx] * hann_window[i];
     fft_work[2 * i + 1] = 0.0f;
   }
 

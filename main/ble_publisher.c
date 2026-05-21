@@ -241,17 +241,18 @@ static void start_advertising(void) {
     return;
   }
 
-  // 250 ms advertising interval — fast enough that a phone scanner can both
-  // see the device AND complete a connect request within its typical 10 s
-  // scan window. The 5 s interval we had before saved a tiny bit of power
-  // but made connection establishment unreliable; phones could see the name
-  // (cached adv) but couldn't actually pair. Advertising automatically
-  // stops while connected, so the higher rate only applies when idle.
+  // 1 s advertising interval — common "low-power-but-still-responsive"
+  // value (Eddystone beacons, most accessories that aren't trying to be
+  // discovered instantly). Web Bluetooth picker sees the device within
+  // 1–2 bursts; connection setup adds maybe a second. The 250 ms we used
+  // earlier was tuned for fast pairing while debugging; now that the
+  // device is provisioned rarely, the radio duty cycle wins.
+  // (5 s was too long — phones cached the name but couldn't pair reliably.)
   struct ble_gap_adv_params adv_params = {
       .conn_mode = BLE_GAP_CONN_MODE_UND,
       .disc_mode = BLE_GAP_DISC_MODE_GEN,
-      .itvl_min = BLE_GAP_ADV_ITVL_MS(250),
-      .itvl_max = BLE_GAP_ADV_ITVL_MS(250),
+      .itvl_min = BLE_GAP_ADV_ITVL_MS(1000),
+      .itvl_max = BLE_GAP_ADV_ITVL_MS(1000),
   };
   rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, gap_event, NULL);
   if (rc != 0) ESP_LOGE(TAG, "ble_gap_adv_start: %d", rc);

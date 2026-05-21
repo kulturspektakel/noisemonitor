@@ -29,10 +29,8 @@ static const char* ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 static LogMessage log_message_buf;
 static int records_count = 0;
 
-static bool write_pb_to_file(pb_ostream_t* stream, const uint8_t* buffer, size_t count) {
-  FILE* file = (FILE*)stream->state;
-  size_t written = fwrite(buffer, 1, count, file);
-  return written == count;
+static bool write_pb_to_file(pb_ostream_t* stream, const uint8_t* buf, size_t count) {
+  return fwrite(buf, 1, count, (FILE*)stream->state) == count;
 }
 
 static void maybe_create_log_dir(void) {
@@ -117,8 +115,6 @@ static void flush_to_file(void) {
   log_message_buf.noise_recording.laeq_30m     = agg.laeq_30m;
   log_message_buf.noise_recording.lceq_30m     = agg.lceq_30m;
 
-  ensure_free_space();
-
   char filename[256];
   snprintf(
       filename,
@@ -129,6 +125,8 @@ static void flush_to_file(void) {
       log_message_buf.client_id
   );
   ESP_LOGI(TAG, "Writing log file %s (%d records)", filename, records_count);
+
+  ensure_free_space();
 
   FILE* file = fopen(filename, "w");
   if (file == NULL) {
@@ -143,14 +141,11 @@ static void flush_to_file(void) {
       .max_size = SIZE_MAX,
       .bytes_written = 0,
   };
-
-  if (!pb_encode(&stream, LogMessage_fields, &log_message_buf)) {
-    ESP_LOGE(TAG, "Failed to encode log: %s", stream.errmsg);
-  }
+  bool ok = pb_encode(&stream, LogMessage_fields, &log_message_buf);
+  if (!ok) ESP_LOGE(TAG, "Failed to encode log: %s", stream.errmsg);
   fclose(file);
 
-  xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eIncrement);
-
+  if (ok) xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eIncrement);
   records_count = 0;
 }
 

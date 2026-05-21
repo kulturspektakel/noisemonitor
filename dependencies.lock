@@ -89,20 +89,12 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.9.2
-  livekit/nanopb:
-    component_hash: 5b3bd915d2eb2ad1a7bb4a3ca655c40f31bab5f4f48e75ec04e300dc9ab78f4d
-    dependencies: []
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.4.9
 direct_dependencies:
 - esp-idf-lib/ds3231
 - esp-idf-lib/i2cdev
 - espressif/esp-dsp
 - idf
 - joltwallet/littlefs
-- livekit/nanopb
-manifest_hash: f808d81662499f5ea556bf216129f1eb550af0919893438a23cbd55bd8238659
+manifest_hash: 0c3b49fda5b93db9ae9e828d76afcf58d625c24982d6056efbdf4f36cd245ac5
 target: esp32s3
 version: 2.0.0

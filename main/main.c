@@ -26,14 +26,16 @@ EventGroupHandle_t event_group;
 SemaphoreHandle_t network_request;
 
 void app_main(void) {
-  // Dynamic frequency scaling: cap at 160 MHz (where DSP comfortably fits),
-  // let the chip drop to 40 MHz and light-sleep between activations. Drivers
-  // acquire PM locks while busy, so audio I²S, WiFi, and BLE timing are
-  // preserved. CPU at idle drops from ~25 mA to a fraction of that.
+  // Dynamic frequency scaling between 40 MHz idle and 160 MHz active.
+  // Light sleep is disabled: the I²S driver holds an APB-freq lock while
+  // its RX channel is running, and the audio_dsp task on Core 1 runs at
+  // ~100 % utilization (4096-pt FFT every 21 ms), so the kernel never
+  // gets a window where both cores are idle. DFS is the only PM mode
+  // that actually fires here.
   esp_pm_config_t pm_cfg = {
       .max_freq_mhz = 160,
       .min_freq_mhz = 40,
-      .light_sleep_enable = true,
+      .light_sleep_enable = false,
   };
   ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
 
@@ -82,7 +84,6 @@ void app_main(void) {
   xTaskCreate(&load_device_id,   "load_device_id",      3072, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&load_salt,        "load_salt",           3072, NULL, TASK_PRIO_NORMAL, NULL);
 
-  // Adapted
   xTaskCreate(&record_writer,    "record_writer",       4096, NULL, TASK_PRIO_NORMAL, NULL);
 
   // New
