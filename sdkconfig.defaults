@@ -89,11 +89,17 @@ CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
 # mbedtls SSL session buffers. Defaults are 16384 each (32 KB total per
-# connection) which can't be allocated contiguously in our post-BLE heap
-# (MBEDTLS_ERR_SSL_ALLOC_FAILED). MQTT publishes are 1–2 KB; HTTPS log
-# uploads are ~15 KB; 4096 is plenty for both with a margin.
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+# connection). 4096 was OK while only MQTT had a TLS session open, but
+# the log_uploader's HTTPS handshake then can't find a second contiguous
+# 4 KB chunk (MBEDTLS_ERR_SSL_ALLOC_FAILED) when MQTT is already up.
+# 2048 lets both sessions coexist. Risk: TLS handshakes that send cert
+# chains bigger than 2 KB records will fail; our log-upload server is
+# under our control so we can verify it stays small (Let's Encrypt cert
+# chains are typically ~2 KB and fit). MQTT publishes are 1–2 KB and
+# HTTPS log uploads are ~15 KB application-level, which still works
+# because mbedtls fragments larger app payloads across multiple records.
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=2048
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
 
 # Power management — dynamic frequency scaling only. Light sleep is off
 # (esp_pm_configure() in main.c sets light_sleep_enable=false): continuous

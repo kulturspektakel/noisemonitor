@@ -210,13 +210,19 @@ void log_uploader(void* params) {
     }
 
     if (log_files_to_upload > 0) {
+      // 30 s retry. The boot-time SSL handshake race (heap still
+      // settling from MQTT init, mbedtls_ssl_setup hits ALLOC_FAILED)
+      // resolves within seconds, so 5 min was overkill and made the
+      // backlog drain at ~one-file-per-5-min worst case. With 30 s
+      // a backlog of N files drains in about N×(upload_time+30 s)
+      // assuming subsequent uploads succeed once heap is stable.
       if (retry_timer == NULL) {
         retry_timer =
-            xTimerCreate("retry_timer", pdMS_TO_TICKS(300000), pdFALSE, NULL, retry_upload);
+            xTimerCreate("retry_timer", pdMS_TO_TICKS(30000), pdFALSE, NULL, retry_upload);
       }
       ESP_LOGI(
           LOG_UPLOADER_TASK,
-          "Encountered %d errors while uploading. Scheduling retry in 5 Minutes",
+          "Encountered %d errors while uploading. Scheduling retry in 30 s",
           error_count
       );
       xTimerReset(retry_timer, 0);
