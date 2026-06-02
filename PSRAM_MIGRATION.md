@@ -9,6 +9,14 @@ internal SRAM. Once the PSRAM board lands, walk this list top-to-bottom and
 unwind the items in **Section 1**. The items in **Section 2** are not
 memory-driven and should stay.
 
+> **Status (2026-06):** BLE is currently disabled via `DEV_NO_BLE` in
+> `main/main.c` to free enough internal heap for HTTPS uploads to work
+> while we wait for the PSRAM board. While BLE is off, all of the
+> workarounds whose only reason was "BLE eats too much heap" have been
+> pre-reverted — see the **Done early** tags below. When the PSRAM
+> board lands the remaining work is just: enable SPIRAM, tag the big
+> BSS arrays `EXT_RAM_BSS_ATTR`, and remove the `DEV_NO_BLE` define.
+
 ## TL;DR — the one-line revert to get the 30-min average back
 
 `main/audio_dsp.c`:
@@ -59,65 +67,44 @@ as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
 - **Benefit:** More DSP idle time → more time in light sleep → battery win.
   Not a code-complexity revert, but a performance recovery.
 
-### 4. BLE-first startup ordering (`BLE_HOST_READY` event bit)
-- **Where:** `main/ble_publisher.c:355-359`, `main/wifi_connect.c:118-119`,
-  `main/event_group.h:12`
-- **What:** `wifi_connect` waits on `BLE_HOST_READY` before starting WiFi
-  init. `ble_publisher` sets the bit after `nimble_port_freertos_init`.
-- **Why:** The BLE controller's runtime allocations need ~30 KB contiguous
-  `MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA`. If WiFi runs first and eats
-  ~110 KB, the controller's first HCI `set_advertising_data` fails with
-  `BLE_ERR_MEM_CAPACITY` and the device becomes silently undiscoverable.
-- **Revert:** Drop the `BLE_HOST_READY` bit entirely, drop the
-  `xEventGroupWaitBits` call in `wifi_connect`, drop the
-  `xEventGroupSetBits` call in `ble_publisher`. Startup tasks fire in any
-  order.
-- **Benefit:** Two fewer cross-file coupling points.
+### 4. BLE-first startup ordering (`BLE_HOST_READY` event bit) — **Done early**
+- **Status:** Removed. `BLE_HOST_READY` no longer exists in
+  `event_group.h`; `wifi_connect` no longer waits on it; `ble_publisher`
+  no longer sets it. Startup tasks fire in any order.
+- **Why it was safe to remove now:** BLE is off (`DEV_NO_BLE`), so the
+  ordering it enforced has no current effect. Post-PSRAM the BLE
+  controller has enough heap regardless of WiFi init order.
 
-### 5. MQTT client config trim
-- **Where:** `main/mqtt_publisher.c:55-65`
-- **What:** `buffer.size = 256`, `buffer.out_size = 256`,
-  `task.stack_size = 3072`.
-- **Why:** Defaults (1024/1024 buffers, 6144 stack) don't fit in the
-  fragmented post-init heap.
-- **Revert:** Restore defaults. The buffer cuts currently cap publish size
-  to 256 B (we publish ~100 B today, so it's fine, but it's a ceiling worth
-  removing).
+### 5. MQTT client config trim — **Done early**
+- **Status:** Removed. `main/mqtt_publisher.c` no longer overrides
+  `buffer.size`, `buffer.out_size`, or `task.stack_size` — the IDF
+  defaults (1024/1024/6144) apply.
+- **Why it was safe to remove now:** With BLE off there's heap to spare;
+  with BLE back on PSRAM, the MQTT client buffers go to internal RAM
+  but the budget supports defaults.
 
-### 6. NimBLE host pool trims
-- **Where:** `sdkconfig.defaults:48-52`
-- **What:**
-  - `CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=4` (default 12)
-  - `CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4` (default 24)
-  - `CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=2` (default 24)
-  - `CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=10` (default 30)
-  - `CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=4` (default 8)
-- **Why:** Each pool is allocated from internal heap. The cuts above save
-  ~5 KB which we need for the host task to spawn at all.
-- **Revert:** Restore defaults. NimBLE host buffers stay in internal RAM
-  (they're touched on hot paths and need fast access) but with PSRAM more
-  internal heap is available.
-- **Benefit:** Headroom for bursty BLE traffic (multi-byte writes,
-  back-to-back notifications).
+### 6. NimBLE host pool trims — **Done early**
+- **Status:** Removed. The `CONFIG_BT_NIMBLE_MSYS_*`,
+  `CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT`, and
+  `CONFIG_BT_NIMBLE_TRANSPORT_EVT_*_COUNT` lines are out of
+  `sdkconfig.defaults` — IDF defaults (12/24/24/30/8) apply.
+- **Why it was safe to remove now:** BLE off → pools aren't allocated.
+  When BLE comes back together with PSRAM the defaults fit.
 
-### 7. mbedtls SSL buffers shrunk
-- **Where:** `sdkconfig.defaults:92-93`
-- **What:** `MBEDTLS_SSL_IN_CONTENT_LEN=4096`, `MBEDTLS_SSL_OUT_CONTENT_LEN=4096`.
-- **Why:** Defaults (16384 each, 32 KB per connection) can't be allocated
-  contiguously after BLE.
-- **Revert:** Restore defaults.
-- **Benefit:** More compatibility with servers that send larger TLS
-  handshake records or fragmented certs. No more
-  `MBEDTLS_ERR_SSL_ALLOC_FAILED` surprises.
+### 7. mbedtls SSL buffers shrunk — **Done early**
+- **Status:** Restored. `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384`,
+  `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384` (IDF defaults).
+- **Why it was safe to restore now:** BLE off frees ~80 KB of internal
+  heap; 32 KB of TLS buffers fits comfortably during a handshake. No
+  more `-0x7100`/`-0x7F00` surprises when a server presents a fatter
+  cert chain.
 
-### 8. LWIP TCP send/recv windows shrunk
-- **Where:** `sdkconfig.defaults:86-87`
-- **What:** `LWIP_TCP_SND_BUF_DEFAULT=2880`, `LWIP_TCP_WND_DEFAULT=2880`
-  (default 5760).
-- **Why:** TCP buffers eat heap.
-- **Revert:** Restore defaults. Together with
-  `SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`, these buffers go to PSRAM.
-- **Benefit:** ~2× throughput on HTTPS log uploads.
+### 8. LWIP TCP send/recv windows shrunk — **Done early**
+- **Status:** Restored. `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760`,
+  `CONFIG_LWIP_TCP_WND_DEFAULT=5760` (IDF defaults).
+- **Why it was safe to restore now:** Same as item 7. Post-PSRAM these
+  will move to PSRAM via `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`.
+- **Benefit already realized:** ~2× HTTPS upload throughput today.
 
 ### 9. `LogMessage log_message_buf` as static BSS
 - **Where:** `main/record_writer.c:29`
@@ -129,19 +116,15 @@ as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
 - **Revert (option B):** Go back to `calloc` (in PSRAM), free after flush.
 - **Benefit:** Dynamic sizing if `RECORDS_PER_FILE` changes later.
 
-### 10. WiFi RX/TX buffer counts
-- **Where:** `sdkconfig.defaults:83-85`
-- **What:**
-  - `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6`
-  - `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16`
-  - `CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16`
-- **Why:** Each static RX buffer is 1600 B; defaults can't all be allocated
-  in the post-BLE heap. We've seen runtime `wifi:m f null` starvation
-  warnings when these get too tight.
-- **Revert:** With `SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` the WiFi buffer pool
-  moves to PSRAM. Then increase the counts (24/32/32 is reasonable).
-- **Benefit:** No more packet drops or `m f null` under sustained load,
-  better TLS resilience.
+### 10. WiFi RX/TX buffer counts — **Done early**
+- **Status:** Bumped. `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=24`,
+  `CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32`,
+  `CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32`.
+- **Why it was safe to bump now:** BLE off frees the heap that previously
+  blocked the larger pool. Post-PSRAM with
+  `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` these move to PSRAM.
+- **Benefit already realized:** No more `wifi:m f null` starvation
+  warnings during HTTPS uploads.
 
 ## Section 2 — Keep (not memory-driven, or zero cost)
 
@@ -164,6 +147,8 @@ These are correct/legitimate decisions independent of heap pressure. Do
 | LittleFS partition layout + 300-record file batches | Storage, not memory. |
 | ANSI FFT variants instead of SIMD (`dsps_fft2r_fc32_ansi` not `_aes3`) | Independent bug in esp-dsp SIMD path (`im=1.6` artifact). Stay on ANSI until the upstream bug is fixed. |
 | `record_to_pb` helper | Single source of truth for `record_t → NoiseRecording_Record`. Code quality, not memory. |
+| `audio_dsp` reader + `fft_worker` task split (`audio_dsp.c`) | Decouples I²S read from FFT compute so the DMA pool can stay small and FFT slowdowns don't drop samples. Architectural; keep regardless of PSRAM. |
+| Wall-clock-paced `WORK_EMIT` (`audio_dsp.c`, `next_emit_us`) | Pins record emission to 1 Hz wall clock instead of sample count. Correctness for server-side `measuredAt` reconstruction; keep regardless of PSRAM. |
 
 ## Workflow when N16R2 arrives
 
@@ -180,12 +165,15 @@ These are correct/legitimate decisions independent of heap pressure. Do
    (record_writer.c), `fft_work`, `a_weight_bin`, `c_weight_bin`
    (audio_dsp.c). Verify boot.
 
-2. **Commit 2 — structural reverts:** items 1, 2, 4 above (stream encoder,
-   preinit hook, BLE_HOST_READY ordering bit). Highest code-complexity
-   wins.
+2. **Commit 2 — remove `DEV_NO_BLE`:** delete the `DEV_NO_BLE` block in
+   `main/main.c` (`ble_publisher_drain` stand-in + `#ifdef`), restoring
+   the real `ble_publisher` task. Items 4, 5, 6, 7, 8, 10 are already
+   pre-reverted, so re-enabling BLE on the PSRAM heap should Just Work.
 
-3. **Commit 3 — config restorations:** items 5, 6, 7, 8, 10. All
-   sdkconfig knobs back near defaults.
+3. **Commit 3 — structural reverts that need PSRAM:** items 1, 2, 9
+   (stream encoder → heap-staged `NoiseRecording`; drop the
+   `audio_dsp_preinit()` hook; `LogMessage log_message_buf` →
+   `EXT_RAM_BSS_ATTR`).
 
 4. **Optional later — item 3:** radix-4 FFT. Measure DSP utilization
    before/after; only worth doing if you want the extra idle time.

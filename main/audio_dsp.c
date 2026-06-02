@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "heap_diag.h"
 #include "pb_encode.h"
 #include "power_management.h"
@@ -100,9 +101,26 @@ static double   c_weighted_sum_per_sec = 0.0;
 // IIR biquad cascade.
 static double   a_weighted_max_per_fft = 0.0;
 static double   c_weighted_max_per_fft = 0.0;
-static int      fft_windows_in_second = 0;
-static int      broadband_samples_in_second = 0;
-static float    peak_abs_sample_in_second = 0.0f;
+static int      fft_windows_in_second = 0;       // fft_worker-owned
+static float    peak_abs_sample_in_second = 0.0f; // reader-owned
+// Drives wall-clock-paced WORK_EMIT (1 Hz). Sample-counted emission
+// drifted because the old inline FFT blocked I²S reads.
+static int64_t  next_emit_us = 0;
+
+// Reader → fft_worker queue. One FIFO carries both FFT and EMIT
+// messages so emit always sees every FFT queued before it.
+typedef enum {
+  DSP_WORK_FFT,
+  DSP_WORK_EMIT,
+} dsp_work_type_t;
+
+typedef struct {
+  dsp_work_type_t type;
+  int   fft_ring_head_snapshot;  // FFT: ring index at trigger time
+  float peak_abs;                // EMIT: reader's snapshotted peak
+} dsp_work_t;
+
+static QueueHandle_t dsp_work_queue;
 
 // 30-min sliding LAeq/LCeq ring buffers (linear energies, not dB).
 // Same buffers serve the 5-minute window via compute_leq_recent(..., 300).
@@ -294,12 +312,16 @@ static uint8_t encode_db_to_byte(float db) {
 }
 
 // --- FFT execution: pulls FFT_SIZE samples from fft_ring (oldest-first) ----
-static void run_fft_and_accumulate(void) {
-  // Copy fft_ring into fft_work as complex pairs (real, 0), applying the
-  // pre-computed Hann window. fft_ring is circular; oldest sample is at
-  // fft_ring_head.
+//
+// head_snapshot is the value of fft_ring_head at the moment the reader
+// posted WORK_FFT. The reader keeps writing fft_ring while the FFT
+// runs; as long as the FFT completes before the reader writes another
+// FFT_SIZE - FFT_HOP = 2048 samples (~43 ms at 48 kHz), the window
+// pointed at by head_snapshot is untouched. ANSI FFT on this S3 runs
+// well under that bound.
+static void run_fft_and_accumulate(int head_snapshot) {
   for (int i = 0; i < FFT_SIZE; i++) {
-    int idx = (fft_ring_head + i) % FFT_SIZE;
+    int idx = (head_snapshot + i) & (FFT_SIZE - 1);
     fft_work[2 * i]     = fft_ring[idx] * hann_window[i];
     fft_work[2 * i + 1] = 0.0f;
   }
@@ -452,7 +474,9 @@ fail:
 // (spec Appendix). LAFmax/LCfmax/LCpeak are approximated from the FFT band
 // energies in v1 — a Phase E refinement will add per-sample biquad filtering
 // with proper Fast time-weighting (125 ms exponential smoother).
-static void emit_per_second(void) {
+// peak_abs is snapshotted by the reader before posting WORK_EMIT — see
+// dsp_work_t. The other accumulators are owned by this task.
+static void emit_per_second(float peak_abs) {
   float cal = calibration_offset_db();
 
   // LAeq,1s and LCeq,1s from per-bin-weighted FFT energy (accumulated in
@@ -483,8 +507,8 @@ static void emit_per_second(void) {
   // (Still not C-weighted — proper LCpeak needs an IIR C-weight filter on
   // the time-domain samples before the peak detector.)
   const float lcpeak_offset = cal + 20.0f * log10f((float)FFT_SIZE / 4.0f);
-  float lcpeak_db = (peak_abs_sample_in_second > 0.0f)
-      ? 20.0f * log10f(peak_abs_sample_in_second) + lcpeak_offset
+  float lcpeak_db = (peak_abs > 0.0f)
+      ? 20.0f * log10f(peak_abs) + lcpeak_offset
       : 0.0f;
 
   EventBits_t bits = xEventGroupGetBits(event_group);
@@ -528,15 +552,31 @@ static void emit_per_second(void) {
              laeq_db, lceq_db, cal);
   }
 
-  // Reset per-second accumulators
+  // Reset per-second accumulators owned by this task. Reader resets
+  // its own (peak_abs_sample_in_second) at the WORK_EMIT post site.
   for (int b = 0; b < NOISE_BANDS; b++) band_energy_sum[b] = 0.0;
   a_weighted_sum_per_sec = 0.0;
   c_weighted_sum_per_sec = 0.0;
   a_weighted_max_per_fft = 0.0;
   c_weighted_max_per_fft = 0.0;
   fft_windows_in_second = 0;
-  broadband_samples_in_second = 0;
-  peak_abs_sample_in_second = 0.0f;
+}
+
+// --- FFT worker task --------------------------------------------------------
+static void fft_worker(void* params) {
+  (void)params;
+  dsp_work_t w;
+  while (true) {
+    if (xQueueReceive(dsp_work_queue, &w, portMAX_DELAY) != pdTRUE) continue;
+    switch (w.type) {
+      case DSP_WORK_FFT:
+        run_fft_and_accumulate(w.fft_ring_head_snapshot);
+        break;
+      case DSP_WORK_EMIT:
+        emit_per_second(w.peak_abs);
+        break;
+    }
+  }
 }
 
 // --- Main task ---------------------------------------------------------------
@@ -549,6 +589,17 @@ void audio_dsp(void* params) {
   dsp_init();
   ESP_LOGI(TAG, "DSP initialized; sampling at %d Hz, %d-pt FFT", SAMPLE_RATE, FFT_SIZE);
   heap_diag("after dsp ready");
+
+  // Spawn the FFT worker. Same core as the reader (Core 1) but lower
+  // priority so the reader always preempts to service I²S — the worker
+  // gets the gaps. 8 deep covers ~340 ms of buffered work; if it fills
+  // the reader logs and drops a message rather than blocking I²S.
+  // 6 KB stack covers emit_per_second's printf + three xQueueSends with
+  // margin (record_writer hit 4 KB exactly).
+  dsp_work_queue = xQueueCreate(8, sizeof(dsp_work_t));
+  xTaskCreatePinnedToCore(&fft_worker, "fft_worker", 6144, NULL, TASK_PRIO_NORMAL, NULL, 1);
+
+  next_emit_us = esp_timer_get_time() + 1000000;
 
   while (true) {
     size_t bytes_read = 0;
@@ -573,25 +624,44 @@ void audio_dsp(void* params) {
       int32_t s24 = raw_buffer[i] >> 8;
       float f = (float)s24 / 8388608.0f;   // 2^23
 
-      // Broadband accumulators
-      broadband_samples_in_second++;
       float af = fabsf(f);
       if (af > peak_abs_sample_in_second) peak_abs_sample_in_second = af;
 
-      // Append to FFT ring (circular)
+      // Append to FFT ring (circular). FFT_SIZE is a power of two so
+      // the wrap is a single AND; signed `%` would compile to a real
+      // division.
       fft_ring[fft_ring_head] = f;
-      fft_ring_head = (fft_ring_head + 1) % FFT_SIZE;
+      fft_ring_head = (fft_ring_head + 1) & (FFT_SIZE - 1);
       samples_since_last_fft++;
 
-      // Run FFT every FFT_HOP new samples (50% overlap)
+      // Hand the FFT off to the worker task every FFT_HOP samples.
       if (samples_since_last_fft >= FFT_HOP) {
         samples_since_last_fft = 0;
-        run_fft_and_accumulate();
+        dsp_work_t w = {
+          .type = DSP_WORK_FFT,
+          .fft_ring_head_snapshot = fft_ring_head,
+        };
+        if (xQueueSend(dsp_work_queue, &w, 0) != pdTRUE) {
+          ESP_LOGW(TAG, "dsp_work_queue full, dropping FFT");
+        }
       }
+    }
 
-      // Emit a record once we've consumed SAMPLE_RATE samples
-      if (broadband_samples_in_second >= SAMPLE_RATE) {
-        emit_per_second();
+    // Wall-clock-paced emission. Checked once per I²S read (every ~21 ms
+    // when sample-paced) so it fires within one buffer of the deadline.
+    // Snapshot+reset peak here so the worker reads the value from the
+    // message and never races with the per-sample loop. If we fall
+    // behind, resync to "now" rather than catch-up bursting.
+    int64_t now_us = esp_timer_get_time();
+    if (now_us >= next_emit_us) {
+      dsp_work_t w = {
+        .type = DSP_WORK_EMIT,
+        .peak_abs = peak_abs_sample_in_second,
+      };
+      peak_abs_sample_in_second = 0.0f;
+      next_emit_us = now_us + 1000000;
+      if (xQueueSend(dsp_work_queue, &w, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "dsp_work_queue full, dropping EMIT");
       }
     }
   }

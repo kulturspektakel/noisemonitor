@@ -1,4 +1,17 @@
 #include <stdio.h>
+
+// Dev-time hack: skip BLE bring-up so the HTTPS log_uploader can find
+// enough contiguous heap to allocate mbedtls's session buffers. NimBLE
+// + the BT controller are the largest single contributor to post-init
+// fragmentation on this no-PSRAM board (see LOG_UPLOAD_PRE_PSRAM.md
+// and PSRAM_MIGRATION.md). With this defined the device boots with
+// WiFi/MQTT/upload only — calibration + WiFi creds entry over BLE are
+// unavailable, so credentials must already be in NVS.
+//
+// Comment out to restore BLE. Becomes irrelevant once the PSRAM board
+// lands; remove together with the other no-PSRAM workarounds then.
+#define DEV_NO_BLE
+
 #include "audio_dsp.h"
 #include "ble_publisher.h"
 #include "calibration.h"
@@ -24,6 +37,15 @@
 
 EventGroupHandle_t event_group;
 SemaphoreHandle_t network_request;
+
+#ifdef DEV_NO_BLE
+// Stand-in for ble_publisher: keep ble_publisher_queue drained so the
+// DSP's non-blocking sends don't accumulate "queue full" warnings.
+static void ble_publisher_drain(void* params) {
+  record_t r;
+  while (true) xQueueReceive(ble_publisher_queue, &r, portMAX_DELAY);
+}
+#endif
 
 void app_main(void) {
   // Dynamic frequency scaling between 40 MHz idle and 160 MHz active.
@@ -84,11 +106,18 @@ void app_main(void) {
   xTaskCreate(&load_device_id,   "load_device_id",      3072, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&load_salt,        "load_salt",           3072, NULL, TASK_PRIO_NORMAL, NULL);
 
-  xTaskCreate(&record_writer,    "record_writer",       4096, NULL, TASK_PRIO_NORMAL, NULL);
+  // 4096 stack-overflowed during flush_to_file at 300 records: pb_encode
+  // recurses over the noise_recording submessage, then esp_littlefs_info
+  // + LittleFS write/commit on the same stack pushed it past the canary.
+  xTaskCreate(&record_writer,    "record_writer",       6144, NULL, TASK_PRIO_NORMAL, NULL);
 
   // New
   xTaskCreate(&mqtt_publisher,   "mqtt_publisher",      4096, NULL, TASK_PRIO_NORMAL, NULL);
+#ifdef DEV_NO_BLE
+  xTaskCreate(&ble_publisher_drain, "ble_drain",        2048, NULL, TASK_PRIO_NORMAL, NULL);
+#else
   xTaskCreate(&ble_publisher,    "ble_publisher",       4096, NULL, TASK_PRIO_NORMAL, NULL);
+#endif
   xTaskCreate(&status_led,       "status_led",          2048, NULL, TASK_PRIO_NORMAL, NULL);
 
   // Real-time DSP pinned to Core 1, isolated from networking (§6).

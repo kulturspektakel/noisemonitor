@@ -33,23 +33,6 @@ CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 # (At 1 the controller returned HCI 0x07 "Memory Capacity Exceeded" on
 # ble_gap_adv_start because no slot remained for the eventual connection.)
 CONFIG_BT_CTRL_BLE_MAX_ACT=2
-# NimBLE host mbuf + transport pools. Trimmed twice: first cut took defaults
-# down for a peripheral with one client (write-long, multi-connection sizing
-# isn't relevant here). Second cut (current values) was forced by the 30-min
-# Leq rings adding 7.2 KB of BSS — without it nimble_host_task xTaskCreate
-# silently failed with only ~2.5 KB largest contiguous heap remaining after
-# WiFi + DSP init, leaving BLE non-discoverable. Current sizes:
-#   MSYS_1: 4 × 256 B = 1 KB
-#   MSYS_2: 4 × 320 B = 1.25 KB
-#   ACL_FROM_LL: 2 × 255 B = ~0.5 KB
-#   EVT pool: 10 × 70 B + 4 × 70 B discardable = ~1 KB
-# Net delta vs first cut: -5 KB on the heap, enough to spawn host_task and
-# leave WiFi room to allocate its 6 RX buffers.
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=4
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=2
-CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=10
-CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=4
 # We don't pair/bond.
 CONFIG_BT_NIMBLE_MAX_BONDS=0
 # NimBLE host task stack. 3 KB was too tight — the GAP disconnect event
@@ -78,28 +61,21 @@ CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n
 CONFIG_SPI_FLASH_AUTO_SUSPEND=y
 CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
 
-# Memory tuning: the 4096-pt FFT consumes ~128 KB of static + heap. The
-# defaults for WiFi/LWIP/NimBLE assume a less memory-constrained app, so
-# trim them to our actual workload: 1 Hz MQTT publish, occasional HTTPS
-# upload, 1 BLE client. Frees enough heap that WiFi + BLE init succeed
-# without malloc fails after the FFT table is allocated.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
-CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
-CONFIG_LWIP_TCP_WND_DEFAULT=2880
-# mbedtls SSL session buffers. Defaults are 16384 each (32 KB total per
-# connection). 4096 was OK while only MQTT had a TLS session open, but
-# the log_uploader's HTTPS handshake then can't find a second contiguous
-# 4 KB chunk (MBEDTLS_ERR_SSL_ALLOC_FAILED) when MQTT is already up.
-# 2048 lets both sessions coexist. Risk: TLS handshakes that send cert
-# chains bigger than 2 KB records will fail; our log-upload server is
-# under our control so we can verify it stays small (Let's Encrypt cert
-# chains are typically ~2 KB and fit). MQTT publishes are 1–2 KB and
-# HTTPS log uploads are ~15 KB application-level, which still works
-# because mbedtls fragments larger app payloads across multiple records.
-CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=2048
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
+# WiFi/LWIP buffers above IDF defaults to handle sustained HTTPS upload
+# load without `wifi:m f null` starvation. Affordable while BLE is off
+# (DEV_NO_BLE in main.c) and stays affordable post-PSRAM via
+# SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=24
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+# mbedtls SSL buffers at IDF default. Anything smaller risks
+# MBEDTLS_ERR_SSL_BAD_INPUT_DATA (-0x7100) when a server's Certificate
+# record exceeds the limit (Let's Encrypt R12 chain measured at 2722 B,
+# headed up only).
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
 
 # Power management — dynamic frequency scaling only. Light sleep is off
 # (esp_pm_configure() in main.c sets light_sleep_enable=false): continuous

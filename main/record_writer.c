@@ -28,6 +28,11 @@ static const char* ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 // are explicitly rewritten in flush_to_file() on every batch.
 static LogMessage log_message_buf;
 static int records_count = 0;
+// Wall-clock time of records[0] in the current batch, captured when the
+// batch starts (records_count transitions 0 → 1). The server treats
+// `device_time` as the timestamp of the first record, so stamping it at
+// flush time (~5 min later) would shift every measuredAt into the future.
+static time_t first_record_time = 0;
 
 static bool write_pb_to_file(pb_ostream_t* stream, const uint8_t* buf, size_t count) {
   return fwrite(buf, 1, count, (FILE*)stream->state) == count;
@@ -96,7 +101,7 @@ static void generate_client_id(char* dst, size_t dst_size) {
 static void flush_to_file(void) {
   strlcpy(log_message_buf.device_id, DEVICE_ID, sizeof(log_message_buf.device_id));
   generate_client_id(log_message_buf.client_id, sizeof(log_message_buf.client_id));
-  log_message_buf.device_time = (int32_t)time(NULL);
+  log_message_buf.device_time = (int32_t)first_record_time;
   log_message_buf.device_time_is_utc = true;
   log_message_buf.has_battery_voltage = true;
   log_message_buf.battery_voltage = battery_voltage;
@@ -156,6 +161,9 @@ void record_writer(void* params) {
     record_t r;
     if (xQueueReceive(record_writer_queue, &r, portMAX_DELAY) != pdTRUE) continue;
 
+    if (records_count == 0) {
+      first_record_time = time(NULL);
+    }
     record_to_pb(&r, &log_message_buf.noise_recording.records[records_count]);
     records_count++;
     if (records_count >= RECORDS_PER_FILE) {

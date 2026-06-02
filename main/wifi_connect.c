@@ -115,9 +115,6 @@ static esp_err_t read_nvs_string(
 }
 
 void wifi_connect(void* params) {
-  // Gate WiFi init on BLE host bring-up — see ble_publisher.c for why.
-  xEventGroupWaitBits(event_group, BLE_HOST_READY, false, true, portMAX_DELAY);
-
   wifi_config_t wifi_config = {
       .sta = {.ssid = "", .password = ""},
   };

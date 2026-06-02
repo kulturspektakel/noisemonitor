@@ -9,7 +9,7 @@
 #define NVS_NOISE_CAL_OFFSET "offset_db_x100"
 
 #define TZ "CET-1CEST,M3.5.0,M10.5.0/3"
-#define API_HOST "api.kulturspektakel.de"
+#define API_HOST "www.kulturspektakel.de"
 
 #define TASK_PRIO_NORMAL 5
 #define TASK_PRIO_HIGH 10

@@ -63,15 +63,6 @@ void mqtt_publisher(void* params) {
   esp_mqtt_client_config_t cfg = {
       .broker.address.uri = MQTT_URI,
       .broker.verification.skip_cert_common_name_check = true,
-      // Our messages are ~50–100 bytes; trim from the default 1024 each so
-      // the client's allocations fit in the post-init heap.
-      .buffer.size      = 256,
-      .buffer.out_size  = 256,
-      // Default 6 KB doesn't fit in the post-init heap (largest contiguous
-      // chunk ~4 KB after WiFi/BLE/audio_dsp init). 3072 leaves ~1 KB margin
-      // for fragmentation; we publish small messages and don't use TLS so
-      // the stack pressure is light.
-      .task.stack_size  = 3072,
   };
   mqtt_client = esp_mqtt_client_init(&cfg);
   esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
