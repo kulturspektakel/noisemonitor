@@ -63,6 +63,16 @@ static const float band_centers[NOISE_BANDS] = {
     16000
 };
 
+// Per-band frequency-response correction for the INMP441 chain, in dB
+// (added in dB-space; positive = "this band reads low, push it up").
+// Folded into the per-bin A/C weights and the band-sum multiplier at
+// init, so it corrects the 31-band display, LAeq, LCeq, LAFmax, and
+// LCFmax. Layered under calibration_offset_db() (the BLE-set scalar).
+// LCpeak is not corrected — it's a time-domain metric.
+// All zeros = no correction. Fill in once the assembled enclosure has
+// been characterised against a reference SPL meter.
+static const float band_cal_offset_db[NOISE_BANDS] = { 0 };
+
 // A/C-weighting now applied per FFT bin (see compute_bin_weights) using the
 // IEC 61672 analog filter formulas; the band-table approximation was removed.
 
@@ -84,6 +94,7 @@ static float    fft_work[FFT_SIZE * 2];            // complex pairs for FFT in/o
 // Heap-allocated in audio_dsp_preinit() (called from app_main).
 static float*   fft_table = NULL;
 static int      band_start_bin[NOISE_BANDS + 1];   // inclusive start; one extra = exclusive end of last band
+static float    band_cal_lin[NOISE_BANDS];          // 10^(band_cal_offset_db / 10)
 
 // Per-bin A and C weighting (linear power factors), populated at init from
 // IEC 61672 formulas. 8 KB each, BSS. Avoid the band-center approximation
@@ -267,6 +278,25 @@ static void compute_bin_weights(void) {
   }
 }
 
+// Fold per-band cal into the per-bin A/C weights and pre-compute the
+// linear-power factor used by the band-sum multiplier. Each bin gets
+// the highest-indexed band whose [start, next_start) range covers it
+// — overlaps at low frequencies resolve to last-band-wins. Bins above
+// the top band's edge are left untouched.
+static void apply_band_cal(void) {
+  for (int b = 0; b < NOISE_BANDS; b++) {
+    band_cal_lin[b] = powf(10.0f, band_cal_offset_db[b] / 10.0f);
+  }
+  int b = 0;
+  int top = band_start_bin[NOISE_BANDS];
+  for (int k = 1; k < FFT_SIZE / 2; k++) {
+    if (k >= top) break;
+    while (b + 1 < NOISE_BANDS && band_start_bin[b + 1] <= k) b++;
+    a_weight_bin[k] *= band_cal_lin[b];
+    c_weight_bin[k] *= band_cal_lin[b];
+  }
+}
+
 esp_err_t audio_dsp_preinit(void) {
   // Radix-2 twiddle table = FFT_SIZE floats (16 KB at 4096-pt). Aligned to
   // 16 bytes for esp-dsp's SIMD load instructions.
@@ -295,6 +325,7 @@ static void dsp_init(void) {
   }
   compute_band_edges();
   compute_bin_weights();
+  apply_band_cal();
 
   const float hann_k = 2.0f * (float)M_PI / (float)FFT_SIZE;
   for (int i = 0; i < FFT_SIZE; i++) {
@@ -338,6 +369,8 @@ static void run_fft_and_accumulate(int head_snapshot) {
   // offset — no per-frame compensation needed.
 
   // Accumulate magnitude-squared into bands (for the 31-band per-second display).
+  // Multiply by band_cal_lin[b] to apply the per-band mic-response cal in
+  // linear-power space — equivalent to adding band_cal_offset_db[b] in dB.
   for (int b = 0; b < NOISE_BANDS; b++) {
     int start = band_start_bin[b];
     int end = band_start_bin[b + 1];
@@ -349,9 +382,7 @@ static void run_fft_and_accumulate(int head_snapshot) {
       float im = fft_work[2 * k + 1];
       sum += (double)re * re + (double)im * im;
     }
-    // Sum total band power (not per-bin mean): correct for 1/3-octave SPL
-    // and gives flat frequency response under broadband signals.
-    band_energy_sum[b] += sum;
+    band_energy_sum[b] += sum * (double)band_cal_lin[b];
   }
 
   // Per-bin A/C weighted accumulation for LAeq/LCeq. Applying the weight at
