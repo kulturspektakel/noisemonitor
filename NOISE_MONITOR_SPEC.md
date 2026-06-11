@@ -514,7 +514,7 @@ LCpeak,1m                   READ, NOTIFY      uint8
 Battery voltage             READ, NOTIFY      uint16 millivolts
                                               (sourced from power_management.c::battery_voltage)
 Uptime seconds              READ              uint32
-Calibration offset          READ              sint16, dB × 100
+Per-band calibration        READ, WRITE       31 × sint8, 0.5 dB steps (62→31 B)
 ```
 
 Encoding for dB values matches the protobuf record encoding (uint8 with `byte = (dB − 20) × 2`), so the phone app can share a decoder. Pending-upload count is part of the Status characteristic payload (already exposed as `log_files_pending`).
@@ -591,100 +591,79 @@ New FreeRTOS task pinned to Core 0:
 
 ## 10. Calibration
 
-Each device must be calibrated once before deployment. Calibration produces a single dB offset that's added to all band/peak readings before encoding, and is persisted in NVS so it survives reboot. While uncalibrated **or while the system clock has not been set**, the device does not log to flash and does not publish to MQTT — instead it prints raw broadband readings to the console once per second so the operator can compare against a reference (NIOSH SLM phone app or any handheld SLM) and compute the offset.
+Calibration has two layers:
 
-The clock-not-set precondition is necessary because file names embed a Unix timestamp; emitting data without a valid clock would produce non-sortable filenames and make the ring-buffer eviction logic ambiguous.
+1. **Fixed dB-SPL anchor (compile-time, no operator action).** The DSP pipeline
+   produces un-normalized FFT energy on an arbitrary scale. A constant computed
+   in `audio_dsp.c::dsp_init` maps it to true dB SPL, so a brand-new uncalibrated
+   device already reads within a few dB of reality. The constant folds three
+   fixed factors that the pipeline deliberately skips:
 
-### NVS schema
+   ```
+   energy_mean ≈ (N/2)·(3N/8)·RMS²                       (single-sided Parseval × ΣHann²)
+   C_energy = MIC_DBFS_TO_SPL + 10·log10(2) − 10·log10(3·N²/16)   ≈ +58.0 dB  (N=4096)
+   C_peak   = MIC_DBFS_TO_SPL + 20·log10(√2)                      ≈ +123.0 dB (LCpeak)
+   ```
 
-Namespace: `noise_cal`
+   `MIC_DBFS_TO_SPL = 120` dB from the INMP441 datasheet (−26 dBFS @ 94 dB SPL ⇒
+   0 dBFS = 120 dB SPL); the 3.01 dB terms are the full-scale-sine crest factor.
 
-```
-key                   type    content
-─────────────────────────────────────────────────────────
-offset_db_x100        int32   signed; e.g. +260 = +2.60 dB
-                              presence of this key = device is calibrated
-```
+2. **Per-band trim (operator, over BLE).** 31 signed per-band offsets correct the
+   INMP441 frequency response and any residual flat sensitivity error. These are
+   the *only* runtime knob — the old single scalar offset is gone.
 
-Single key. `nvs_get_i32` returning `ESP_ERR_NVS_NOT_FOUND` means uncalibrated; any value (including 0) means calibrated. No separate boolean flag.
+Logging/publishing is gated on `TIME_SET` (file names embed a Unix timestamp);
+the `CALIBRATED` bit drives the status LED but does not gate data emission.
+
+### Wire & NVS format
+
+- **BLE characteristic** (UUID `…0a02`, READ|WRITE): 31 × `int8`, one per
+  1/3-octave band low→high, in **0.5 dB steps** (`band_dB = byte × 0.5`, range
+  ±63.5 dB; the realistic trim is within ±16 dB now that the SPL anchor carries
+  the bulk). 31 bytes is a single Write Request once the client negotiates a
+  larger MTU — automatic on iOS/Android, and NimBLE's preferred MTU is 256. A
+  client that never raises MTU past the 23-byte default falls back to a Long
+  Write (NimBLE reassembles). READ returns the current 31 bytes; WRITE persists
+  + re-applies.
+- **NVS:** namespace `noise_cal`, key `band_cal_q5` — a 31-byte blob. Presence of
+  the key ⇒ `CALIBRATED`. The obsolete scalar key `offset_db_x100` is erased on
+  boot. `calibration_clear()` erases the blob and clears `CALIBRATED`.
 
 ### Event group bit
 
-Add `CALIBRATED = BIT8` to `event_group.h`. Set when NVS contains `offset_db_x100`; cleared when NVS doesn't or `CAL_CLEAR` is issued.
+`CALIBRATED = BIT8` (`event_group.h`). Set when the `band_cal_q5` blob is present
+(boot or BLE write); cleared by `calibration_clear()`.
 
-### Boot logic
+### Runtime application
 
-1. Read `noise_cal/offset_db_x100` from NVS
-2. If present: store value in a global `calibration_offset_db` (float), set `CALIBRATED` event bit
-3. If absent: leave offset at 0.0, do not set `CALIBRATED` bit, log a warning
-
-### Behavior when fully ready (CALIBRATED && TIME_SET)
-
-- `audio_dsp` adds `calibration_offset_db` to every band/peak value during the dB conversion step (after `10 · log₁₀`, before uint8 encoding)
-- `record_writer` consumes records from its queue, writes files normally
-- `mqtt_publisher` publishes records normally
-- `NoiseRecording` in every file and every MQTT publish carries `calibration_offset_db_x100` so the server knows what offset produced the values
-
-### Behavior when not ready (uncalibrated or no clock)
-
-- `audio_dsp` runs DSP normally; if `CALIBRATED` is unset, the offset applied is 0.0
-- Records are **not** pushed to either queue
-- Once per second, the DSP task prints state and current readings to the ESP-IDF log:
-
-```
-I (32145) cal: NOT LOGGING — calibrated=no, time_set=no. Current readings (raw, offset=0):
-I (32145) cal:   LAeq   = 84.2 dB(A)
-I (32145) cal:   LCeq   = 89.1 dB(C)
-I (32146) cal:   LAFmax = 86.5 dB(A)
-I (32146) cal:   LCpeak = 95.7 dB(C)
-I (32146) cal: To calibrate, send: CAL_SET <(reference - LAeq) * 100>
-```
-
-The `calibrated` and `time_set` fields reflect the current event group state. Once both are set, normal logging begins.
-
-### `cal_console` task — USB-CDC commands
-
-Small task that reads lines from `stdin` (USB-CDC) and parses three commands:
-
-```
-CAL_SET <offset_db_x100>
-  - parse signed integer argument
-  - write to NVS key offset_db_x100
-  - update global calibration_offset_db
-  - set CALIBRATED event bit
-  - reply: "OK offset=+X.XX dB"
-
-CAL_GET
-  - if CALIBRATED bit set:
-      reply: "offset=+X.XX dB"
-  - else:
-      reply: "uncalibrated"
-
-CAL_CLEAR
-  - erase NVS key offset_db_x100
-  - reset global calibration_offset_db to 0.0
-  - clear CALIBRATED event bit
-  - reply: "OK calibration cleared"
-```
-
-Implementation: `fgets` from `stdin` in a loop, `strtok` parsing, `nvs_set_i32` for persistence. ~50 lines of code. ESP-IDF's `esp_console` component is acceptable but not required.
+`calibration_set_bands()` writes NVS, updates the in-RAM cache, and sets a dirty
+flag. The DSP/FFT-worker task tests-and-clears the flag once per second
+(`emit_per_second`) and re-folds the calibration: rebuild the base IEC 61672
+per-bin A/C weights (`compute_bin_weights`, idempotent) then multiply in the
+per-band linear factors (`apply_band_cal`). Doing this in the worker task avoids
+racing the FFT accumulation. A new calibration takes full effect on the next
+second. LAeq/LCeq/LAFmax/LCFmax and the 31-band display all carry the per-band
+trim; LCpeak (time-domain) gets only the *mean* of the band offsets.
 
 ### Calibration workflow (operator-facing)
 
-1. Plug device into laptop via USB
-2. Run `idf.py monitor` or any serial terminal at 115200 baud
-3. Device boots, prints "UNCALIBRATED" output once per second
-4. Place phone (NIOSH SLM app) or handheld SLM within a few cm of the ICS-43434 mic
-5. In a steady noise environment (~50–80 dB ambient, e.g. office hum, running shower, white-noise speaker), let both readings settle
-6. Compute: `offset = reference_LAeq - device_LAeq` (in dB)
-7. Send: `CAL_SET <offset * 100>` (e.g., for +2.60 dB: `CAL_SET 260`)
-8. Device confirms storage, sets `CALIBRATED` bit, begins normal logging
-9. Optional: verify by checking the device's next reported LAeq matches the reference
+1. Connect to the device over BLE (companion app), negotiating MTU ≥ 34.
+2. Place a reference SLM (NIOSH SLM app or handheld) within a few cm of the mic
+   in steady noise; compare the device's per-band / LAeq readings to the
+   reference.
+3. Compute per-band offsets `(reference − device)` in dB, quantize to 0.5 dB
+   steps, and write all 31 bytes in a single BLE write. For a pure overall trim,
+   send the same byte for every band.
+4. The device persists to NVS, sets `CALIBRATED` (LED leaves red), and applies
+   the new curve within ~1 s. Verify the next readings match the reference.
 
 ### Edge cases
 
-- **`CAL_SET 0`** is valid — explicit "zero offset" calibration. Sets `CALIBRATED` bit. Distinguishable from uncalibrated.
-- **NVS read failure** (corrupt storage): treat as uncalibrated, print error to console.
+- **All-zero array** is valid — explicit "no trim" calibration; still sets
+  `CALIBRATED` (the anchor alone already gives near-SPL readings).
+- **Wrong length** write ⇒ rejected (`BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN`).
+- **NVS read failure / wrong-size blob:** treated as uncalibrated (all-zero
+  trim), warning logged.
 
 ---
 

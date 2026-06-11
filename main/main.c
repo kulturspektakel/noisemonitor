@@ -86,10 +86,11 @@ void app_main(void) {
   // service must be installed before any task adds a handler.
   gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
 
-  // Load persisted calibration into the in-RAM offset + set CALIBRATED bit if present.
-  // Devices that have never been calibrated start with offset=0 and produce
-  // raw-FFT-magnitude dB values; the operator can calibrate via the BLE
-  // "cal_offset" characteristic (read/write int32 hundredths-of-dB).
+  // Load persisted per-band calibration + set CALIBRATED bit if present.
+  // Uncalibrated devices start with all-zero band offsets and still read near
+  // dB SPL thanks to the fixed FFT-energy->dB-SPL anchor in audio_dsp.c; the
+  // operator trims the per-band frequency response via the BLE calibration
+  // characteristic (read/write 31 signed bytes, 0.5 dB steps).
   calibration_init();
 
   // Inter-task queues (spec §6). Sized 16 = ~16 s of buffering against any

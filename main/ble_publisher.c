@@ -97,9 +97,15 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
     .characteristics = (struct ble_gatt_chr_def[]) {
       { .uuid = &chr_record_uuid.u, .access_cb = read_record,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_record },
-      // Calibration offset, signed 32-bit hundredths of dB, little-endian.
-      // Read returns current offset; write persists to NVS and sets the
-      // CALIBRATED event bit (so the status LED turns green).
+      // Per-band calibration: 31 signed bytes, one per 1/3-octave band (low to
+      // high), in 0.5 dB steps (range ±63.5 dB; the realistic trim is well
+      // within ±16 dB now that the SPL anchor handles the bulk). 31 bytes goes
+      // in a single Write Request once the client negotiates a larger MTU —
+      // automatic on iOS/Android, and NimBLE's preferred MTU is 256. (If a
+      // client never raises MTU past the 23-byte default it falls back to a
+      // Long Write, which NimBLE reassembles into one mbuf for this callback.)
+      // Read returns the current 31 bytes; write persists to NVS and sets the
+      // CALIBRATED event bit (so the status LED leaves red).
       { .uuid = &chr_cal_uuid.u, .access_cb = access_cal,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE, .val_handle = &h_cal },
       // WiFi credentials, write-only. Payload format:
@@ -139,25 +145,27 @@ static int access_cal(
     uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
 ) {
   if (ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
-    int32_t v = calibration_offset_x100();
-    return os_mbuf_append(ctxt->om, &v, sizeof(v)) == 0
+    int8_t bands[CALIBRATION_BANDS];
+    calibration_get_bands(bands, CALIBRATION_BANDS);
+    return os_mbuf_append(ctxt->om, bands, sizeof(bands)) == 0
         ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
   }
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
-    if (OS_MBUF_PKTLEN(ctxt->om) != sizeof(int32_t)) {
+    if (OS_MBUF_PKTLEN(ctxt->om) != CALIBRATION_BANDS) {
       return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
-    int32_t v = 0;
+    int8_t bands[CALIBRATION_BANDS];
     uint16_t copied = 0;
-    if (ble_hs_mbuf_to_flat(ctxt->om, &v, sizeof(v), &copied) != 0 || copied != sizeof(v)) {
+    if (ble_hs_mbuf_to_flat(ctxt->om, bands, sizeof(bands), &copied) != 0
+        || copied != sizeof(bands)) {
       return BLE_ATT_ERR_UNLIKELY;
     }
-    esp_err_t err = calibration_set(v);
+    esp_err_t err = calibration_set_bands(bands, CALIBRATION_BANDS);
     if (err != ESP_OK) {
-      ESP_LOGW(TAG, "calibration_set(%ld) failed: %s", (long)v, esp_err_to_name(err));
+      ESP_LOGW(TAG, "calibration_set_bands failed: %s", esp_err_to_name(err));
       return BLE_ATT_ERR_UNLIKELY;
     }
-    ESP_LOGI(TAG, "calibration offset set via BLE: %+.2f dB", v / 100.0f);
+    ESP_LOGI(TAG, "per-band calibration set via BLE (%d bands)", CALIBRATION_BANDS);
     return 0;
   }
   return BLE_ATT_ERR_UNLIKELY;

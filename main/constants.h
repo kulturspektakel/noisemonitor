@@ -6,7 +6,8 @@
 #define NVS_SALT "salt"
 
 #define NVS_NOISE_CAL "noise_cal"
-#define NVS_NOISE_CAL_OFFSET "offset_db_x100"
+#define NVS_NOISE_CAL_OFFSET "offset_db_x100"   // obsolete scalar offset (erased on boot)
+#define NVS_NOISE_CAL_BANDS "band_cal_q5"       // blob: 31 int8 per-band offsets, 0.5 dB steps
 
 #define TZ "CET-1CEST,M3.5.0,M10.5.0/3"
 #define API_HOST "www.kulturspektakel.de"

@@ -44,6 +44,22 @@ static const char* TAG = "audio_dsp";
 #define FFT_SIZE 4096
 #define FFT_HOP  2048     // 50% overlap
 
+// --- dB SPL anchor ------------------------------------------------------------
+// The pipeline produces un-normalized FFT energy (no 1/N, no Hann-gain
+// correction) on an arbitrary scale. The constant that maps it to true dB SPL
+// is computed analytically rather than dialed in by hand:
+//
+//   energy_mean ≈ (N/2)·(3N/8)·RMS²            (single-sided Parseval × ΣHann²)
+//   dB_SPL = 10·log10(energy_mean) + C_energy
+//   C_energy = MIC_DBFS_TO_SPL + 10log10(2) − 10log10(3·N²/16)   (≈ +58.0 @ N=4096)
+//   C_peak   = MIC_DBFS_TO_SPL + 20log10(√2)                     (≈ +123.0)
+//
+// MIC_DBFS_TO_SPL: INMP441 datasheet sensitivity −26 dBFS @ 94 dB SPL ⇒
+// 0 dBFS = 120 dB SPL. The 3.01 dB terms are the full-scale-sine crest factor
+// (0 dBFS is defined against a sine of RMS 1/√2). Per-band calibration trims
+// the residual on top of these. Computed in dsp_init() so they track FFT_SIZE.
+#define MIC_DBFS_TO_SPL_DB 120.0f
+
 // --- Aggregate ring size — 30 min holds enough seconds for 5-min and 30-min
 //     sliding-window Leq computations from the same buffer.
 // Ring size for the sliding-window aggregates. Sized for 5-min on the
@@ -65,13 +81,14 @@ static const float band_centers[NOISE_BANDS] = {
 
 // Per-band frequency-response correction for the INMP441 chain, in dB
 // (added in dB-space; positive = "this band reads low, push it up").
-// Folded into the per-bin A/C weights and the band-sum multiplier at
-// init, so it corrects the 31-band display, LAeq, LCeq, LAFmax, and
-// LCFmax. Layered under calibration_offset_db() (the BLE-set scalar).
-// LCpeak is not corrected — it's a time-domain metric.
-// All zeros = no correction. Fill in once the assembled enclosure has
-// been characterised against a reference SPL meter.
-static const float band_cal_offset_db[NOISE_BANDS] = { 0 };
+// Folded into the per-bin A/C weights and the band-sum multiplier, so it
+// corrects the 31-band display, LAeq, LCeq, LAFmax, and LCFmax. This is now
+// the ONLY calibration knob (the old scalar offset is gone — the fixed
+// FFT-energy->dB-SPL anchor lives in dsp_init). Loaded from NVS at init and
+// re-loaded whenever a new calibration arrives over BLE (see reload_band_cal).
+// LCpeak only gets the mean of these (it's a time-domain metric).
+// All zeros = no correction (raw values already near dB SPL via the anchor).
+static float band_cal_offset_db[NOISE_BANDS] = { 0 };
 
 // A/C-weighting now applied per FFT bin (see compute_bin_weights) using the
 // IEC 61672 analog filter formulas; the band-table approximation was removed.
@@ -95,6 +112,10 @@ static float    fft_work[FFT_SIZE * 2];            // complex pairs for FFT in/o
 static float*   fft_table = NULL;
 static int      band_start_bin[NOISE_BANDS + 1];   // inclusive start; one extra = exclusive end of last band
 static float    band_cal_lin[NOISE_BANDS];          // 10^(band_cal_offset_db / 10)
+
+// dB-SPL anchor constants, computed once in dsp_init (see MIC_DBFS_TO_SPL_DB).
+static float    fft_energy_to_spl_db;   // ≈ +58.0 — added to every energy->dB
+static float    peak_to_spl_db;         // ≈ +123.0 — LCpeak amplitude->dB
 
 // Per-bin A and C weighting (linear power factors), populated at init from
 // IEC 61672 formulas. 8 KB each, BSS. Avoid the band-center approximation
@@ -297,6 +318,26 @@ static void apply_band_cal(void) {
   }
 }
 
+// (Re)load per-band calibration from the calibration module and fold it into
+// the per-bin weights. apply_band_cal() multiplies the cal into a_weight_bin/
+// c_weight_bin destructively, so the base weights must be rebuilt from scratch
+// first — compute_bin_weights() is idempotent. Runs in the DSP/FFT-worker task
+// only (init + the once-per-second dirty check), so it never races the FFT
+// accumulation, which runs in the same task.
+static void reload_band_cal(void) {
+  calibration_get_bands_db(band_cal_offset_db, NOISE_BANDS);
+  compute_bin_weights();
+  apply_band_cal();
+}
+
+// Mean of the per-band offsets (dB) — applied to LCpeak, which is time-domain
+// and can't carry a per-band correction.
+static float band_cal_mean_db(void) {
+  float sum = 0.0f;
+  for (int b = 0; b < NOISE_BANDS; b++) sum += band_cal_offset_db[b];
+  return sum / (float)NOISE_BANDS;
+}
+
 esp_err_t audio_dsp_preinit(void) {
   // Radix-2 twiddle table = FFT_SIZE floats (16 KB at 4096-pt). Aligned to
   // 16 bytes for esp-dsp's SIMD load instructions.
@@ -323,9 +364,15 @@ static void dsp_init(void) {
     ESP_LOGE(TAG, "dsps_fft2r_init_fc32 failed: 0x%x", err);
     ESP_ERROR_CHECK(err);
   }
+  // dB-SPL anchor: un-inflate the FFT-energy scale and add INMP441 sensitivity.
+  fft_energy_to_spl_db = MIC_DBFS_TO_SPL_DB + 10.0f * log10f(2.0f)
+      - 10.0f * log10f(3.0f * (float)FFT_SIZE * (float)FFT_SIZE / 16.0f);
+  peak_to_spl_db = MIC_DBFS_TO_SPL_DB + 20.0f * log10f(sqrtf(2.0f));
+  ESP_LOGI(TAG, "SPL anchor: energy %+.2f dB, peak %+.2f dB",
+           fft_energy_to_spl_db, peak_to_spl_db);
+
   compute_band_edges();
-  compute_bin_weights();
-  apply_band_cal();
+  reload_band_cal();   // compute_bin_weights() + fold in NVS per-band cal
 
   const float hann_k = 2.0f * (float)M_PI / (float)FFT_SIZE;
   for (int i = 0; i < FFT_SIZE; i++) {
@@ -508,36 +555,44 @@ fail:
 // peak_abs is snapshotted by the reader before posting WORK_EMIT — see
 // dsp_work_t. The other accumulators are owned by this task.
 static void emit_per_second(float peak_abs) {
-  float cal = calibration_offset_db();
+  // Re-fold per-band calibration if it changed (BLE write / clear). Done here,
+  // in the DSP/FFT-worker task, so the weight-array rebuild can't race the FFT
+  // accumulation. Energy accumulated this second used the OLD weights, but the
+  // change takes full effect from the next second — acceptable for a manual,
+  // infrequent calibration action.
+  if (calibration_take_band_dirty()) {
+    reload_band_cal();
+    ESP_LOGI(TAG, "per-band calibration re-applied");
+  }
 
   // LAeq,1s and LCeq,1s from per-bin-weighted FFT energy (accumulated in
   // run_fft_and_accumulate). This applies the IEC 61672 A/C filter at each
   // bin's actual frequency, eliminating the band-center quantization error.
+  // fft_energy_to_spl_db anchors the un-normalized FFT energy to dB SPL.
   double a_mean = (fft_windows_in_second > 0)
       ? a_weighted_sum_per_sec / (double)fft_windows_in_second
       : 0.0;
   double c_mean = (fft_windows_in_second > 0)
       ? c_weighted_sum_per_sec / (double)fft_windows_in_second
       : 0.0;
-  float laeq_db = (a_mean > 0.0) ? 10.0f * log10f((float)a_mean) + cal : 0.0f;
-  float lceq_db = (c_mean > 0.0) ? 10.0f * log10f((float)c_mean) + cal : 0.0f;
+  float laeq_db = (a_mean > 0.0) ? 10.0f * log10f((float)a_mean) + fft_energy_to_spl_db : 0.0f;
+  float lceq_db = (c_mean > 0.0) ? 10.0f * log10f((float)c_mean) + fft_energy_to_spl_db : 0.0f;
 
   // LAFmax/LCFmax: max single-FFT A/C-weighted energy seen this second.
   // 85 ms FFT window approximates Fast time-weighting; not a perfect IEC
   // 61672 implementation (no exponential smoother) but captures intra-second
   // peaks that the per-second average can't.
   float lafmax_db = (a_weighted_max_per_fft > 0.0)
-      ? 10.0f * log10f((float)a_weighted_max_per_fft) + cal : 0.0f;
+      ? 10.0f * log10f((float)a_weighted_max_per_fft) + fft_energy_to_spl_db : 0.0f;
   float lcfmax_db = (c_weighted_max_per_fft > 0.0)
-      ? 10.0f * log10f((float)c_weighted_max_per_fft) + cal : 0.0f;
-  // LCpeak: unweighted absolute sample peak. Calibration's `cal` offset maps
-  // FFT-energy numbers to dB SPL, but the peak metric operates on raw [-1,1]
-  // sample amplitude — a scale that's ~60 dB different from FFT energy for
-  // our 4096-pt Hann-windowed FFT. The extra 20·log10(FFT_SIZE/4) term
-  // compensates so LCpeak ends up on the same dB SPL scale as LAeq/LCeq.
+      ? 10.0f * log10f((float)c_weighted_max_per_fft) + fft_energy_to_spl_db : 0.0f;
+  // LCpeak: unweighted absolute sample peak. peak_to_spl_db maps the raw
+  // [-1,1] sample-amplitude scale directly to dB SPL (it's a different scale
+  // from FFT energy). Per-band cal can't apply to a time-domain metric, so we
+  // add the mean band offset to keep it tracking the overall sensitivity trim.
   // (Still not C-weighted — proper LCpeak needs an IIR C-weight filter on
   // the time-domain samples before the peak detector.)
-  const float lcpeak_offset = cal + 20.0f * log10f((float)FFT_SIZE / 4.0f);
+  const float lcpeak_offset = peak_to_spl_db + band_cal_mean_db();
   float lcpeak_db = (peak_abs > 0.0f)
       ? 20.0f * log10f(peak_abs) + lcpeak_offset
       : 0.0f;
@@ -560,7 +615,7 @@ static void emit_per_second(float peak_abs) {
       double mean = (fft_windows_in_second > 0)
           ? band_energy_sum[b] / (double)fft_windows_in_second
           : 0.0;
-      float db = (mean > 0.0) ? 10.0f * log10f((float)mean) + cal : 0.0f;
+      float db = (mean > 0.0) ? 10.0f * log10f((float)mean) + fft_energy_to_spl_db : 0.0f;
       r.bands[b] = encode_db_to_byte(db);
     }
     r.laeq_1s   = encode_db_to_byte(laeq_db);
@@ -579,8 +634,8 @@ static void emit_per_second(float peak_abs) {
       ESP_LOGW(TAG, "ble_publisher_queue full, dropping record %lu", (unsigned long)r.seq_no);
     }
   } else {
-    ESP_LOGI(TAG, "waiting for time_set; current LAeq=%.1f LCeq=%.1f (cal offset=%+.2f)",
-             laeq_db, lceq_db, cal);
+    ESP_LOGI(TAG, "waiting for time_set; current LAeq=%.1f LCeq=%.1f (mean band cal=%+.2f)",
+             laeq_db, lceq_db, band_cal_mean_db());
   }
 
   // Reset per-second accumulators owned by this task. Reader resets

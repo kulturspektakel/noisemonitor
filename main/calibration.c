@@ -1,4 +1,6 @@
 #include "calibration.h"
+#include <stdatomic.h>
+#include <string.h>
 #include "constants.h"
 #include "esp_log.h"
 #include "event_group.h"
@@ -8,48 +10,61 @@
 
 static const char* TAG = "calibration";
 
-static float   offset_db   = 0.0f;
-static int32_t offset_x100 = 0;
+// Cached per-band calibration in 0.5 dB steps. All-zero = no correction.
+static int8_t band_steps[CALIBRATION_BANDS];
+// Set whenever band_steps changes; the DSP task tests-and-clears it to re-fold
+// the calibration into its per-bin weights.
+static atomic_bool band_dirty = ATOMIC_VAR_INIT(false);
 
 void calibration_init(void) {
+  memset(band_steps, 0, sizeof(band_steps));
+
   nvs_handle_t handle;
-  esp_err_t err = nvs_open(NVS_NOISE_CAL, NVS_READONLY, &handle);
-  if (err == ESP_ERR_NVS_NOT_FOUND) {
-    ESP_LOGW(TAG, "no calibration namespace; device is UNCALIBRATED");
-    return;
-  }
+  esp_err_t err = nvs_open(NVS_NOISE_CAL, NVS_READWRITE, &handle);
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "nvs_open(%s) failed: %s", NVS_NOISE_CAL, esp_err_to_name(err));
+    ESP_LOGW(TAG, "nvs_open(%s) failed: %s; device UNCALIBRATED",
+             NVS_NOISE_CAL, esp_err_to_name(err));
     return;
   }
-  int32_t v = 0;
-  err = nvs_get_i32(handle, NVS_NOISE_CAL_OFFSET, &v);
+
+  // Drop the obsolete scalar-offset key written by older firmware.
+  nvs_erase_key(handle, NVS_NOISE_CAL_OFFSET);
+
+  size_t len = sizeof(band_steps);
+  err = nvs_get_blob(handle, NVS_NOISE_CAL_BANDS, band_steps, &len);
+  nvs_commit(handle);
   nvs_close(handle);
+
+  if (err == ESP_OK && len == sizeof(band_steps)) {
+    xEventGroupSetBits(event_group, CALIBRATED);
+    atomic_store(&band_dirty, true);
+    ESP_LOGI(TAG, "per-band calibration loaded (%d bands)", CALIBRATION_BANDS);
+    return;
+  }
+
+  // Anything else (missing key, wrong size, read error) = uncalibrated.
+  memset(band_steps, 0, sizeof(band_steps));
   if (err == ESP_ERR_NVS_NOT_FOUND) {
     ESP_LOGW(TAG, "device is UNCALIBRATED");
-    return;
+  } else {
+    ESP_LOGW(TAG, "nvs_get_blob failed (%s); device UNCALIBRATED",
+             esp_err_to_name(err));
   }
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "nvs_get_i32 failed: %s", esp_err_to_name(err));
-    return;
-  }
-  offset_x100 = v;
-  offset_db = v / 100.0f;
-  xEventGroupSetBits(event_group, CALIBRATED);
-  ESP_LOGI(TAG, "calibration loaded: offset=%+.2f dB", offset_db);
 }
 
-esp_err_t calibration_set(int32_t offset_db_x100) {
+esp_err_t calibration_set_bands(const int8_t* steps, size_t n) {
+  if (n != CALIBRATION_BANDS) return ESP_ERR_INVALID_ARG;
+
   nvs_handle_t handle;
   esp_err_t err = nvs_open(NVS_NOISE_CAL, NVS_READWRITE, &handle);
   if (err != ESP_OK) return err;
-  err = nvs_set_i32(handle, NVS_NOISE_CAL_OFFSET, offset_db_x100);
+  err = nvs_set_blob(handle, NVS_NOISE_CAL_BANDS, steps, n);
   if (err == ESP_OK) err = nvs_commit(handle);
   nvs_close(handle);
   if (err != ESP_OK) return err;
 
-  offset_x100 = offset_db_x100;
-  offset_db = offset_db_x100 / 100.0f;
+  memcpy(band_steps, steps, n);
+  atomic_store(&band_dirty, true);
   xEventGroupSetBits(event_group, CALIBRATED);
   return ESP_OK;
 }
@@ -58,24 +73,29 @@ esp_err_t calibration_clear(void) {
   nvs_handle_t handle;
   esp_err_t err = nvs_open(NVS_NOISE_CAL, NVS_READWRITE, &handle);
   if (err != ESP_OK) return err;
-  err = nvs_erase_key(handle, NVS_NOISE_CAL_OFFSET);
+  err = nvs_erase_key(handle, NVS_NOISE_CAL_BANDS);
   if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
     nvs_commit(handle);
     err = ESP_OK;
   }
   nvs_close(handle);
 
-  offset_x100 = 0;
-  offset_db = 0.0f;
+  memset(band_steps, 0, sizeof(band_steps));
+  atomic_store(&band_dirty, true);
   xEventGroupClearBits(event_group, CALIBRATED);
   return err;
 }
 
-float calibration_offset_db(void) {
-  return offset_db;
+void calibration_get_bands(int8_t* out, size_t n) {
+  if (n > CALIBRATION_BANDS) n = CALIBRATION_BANDS;
+  memcpy(out, band_steps, n);
 }
 
-int32_t calibration_offset_x100(void) {
-  return offset_x100;
+void calibration_get_bands_db(float* out_db, size_t n) {
+  if (n > CALIBRATION_BANDS) n = CALIBRATION_BANDS;
+  for (size_t i = 0; i < n; i++) out_db[i] = (float)band_steps[i] * 0.5f;
 }
 
+bool calibration_take_band_dirty(void) {
+  return atomic_exchange(&band_dirty, false);
+}
