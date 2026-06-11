@@ -150,7 +150,13 @@ static void flush_to_file(void) {
   if (!ok) ESP_LOGE(TAG, "Failed to encode log: %s", stream.errmsg);
   fclose(file);
 
-  if (ok) xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eIncrement);
+  // Nudge the uploader to pick up the new file. Look it up by name rather than
+  // holding a handle; it may be absent (e.g. DEV_NO_NET disables the uploader)
+  // or have exited, in which case xTaskNotify(NULL) would assert.
+  if (ok) {
+    TaskHandle_t uploader = xTaskGetHandle(LOG_UPLOADER_TASK);
+    if (uploader) xTaskNotify(uploader, 0, eIncrement);
+  }
   records_count = 0;
 }
 

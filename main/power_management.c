@@ -128,7 +128,15 @@ static void ledc_init() {
   }
 }
 
+// Global LED brightness scale (percent). The status colors are authored at
+// full intensity; scaling every channel here tunes brightness in one place
+// while keeping each color's hue (e.g. amber's 255/90/0 ratio) intact.
+#define LED_BRIGHTNESS_PCT 33
+
 void set_rgb_color(uint8_t red, uint8_t green, uint8_t blue) {
+  red   = (uint16_t)red   * LED_BRIGHTNESS_PCT / 100;
+  green = (uint16_t)green * LED_BRIGHTNESS_PCT / 100;
+  blue  = (uint16_t)blue  * LED_BRIGHTNESS_PCT / 100;
   ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, red);
   ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
   ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, green);

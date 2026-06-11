@@ -265,31 +265,60 @@ static void start_advertising(void) {
   if (rc != 0) ESP_LOGE(TAG, "ble_gap_adv_start: %d", rc);
 }
 
+// Log the live connection parameters for `conn`. Supervision timeout is the
+// one to watch for "drops after a few minutes": if it's short and we miss a
+// run of connection events (e.g. CPU at 40 MHz under DFS), the link times out.
+static void log_conn_params(uint16_t conn, const char* what) {
+  struct ble_gap_conn_desc desc;
+  if (ble_gap_conn_find(conn, &desc) != 0) {
+    ESP_LOGW(TAG, "%s: ble_gap_conn_find failed", what);
+    return;
+  }
+  ESP_LOGI(TAG,
+      "%s: itvl=%u (%.2f ms) latency=%u sup_timeout=%u (%u ms)",
+      what, desc.conn_itvl, desc.conn_itvl * 1.25,
+      desc.conn_latency, desc.supervision_timeout, desc.supervision_timeout * 10);
+}
+
 static int gap_event(struct ble_gap_event* ev, void* arg) {
   switch (ev->type) {
     case BLE_GAP_EVENT_CONNECT:
       if (ev->connect.status == 0) {
         curr_conn = ev->connect.conn_handle;
         ESP_LOGI(TAG, "BLE client connected");
+        log_conn_params(curr_conn, "connect params");
       } else {
+        ESP_LOGW(TAG, "connect failed (status=%d); re-advertising", ev->connect.status);
         start_advertising();
       }
       break;
     case BLE_GAP_EVENT_DISCONNECT:
-      ESP_LOGI(TAG, "BLE client disconnected (reason %d)", ev->disconnect.reason);
+      // reason is an HCI error code. Common ones: 0x08 supervision timeout,
+      // 0x13 remote user terminated, 0x16 local host terminated,
+      // 0x3d connection failed to establish / LMP response timeout.
+      ESP_LOGW(TAG, "BLE client disconnected: reason=%d (0x%02x)",
+               ev->disconnect.reason, ev->disconnect.reason);
       curr_conn = 0xffff;
       record_subscribed = false;
       start_advertising();
       break;
+    case BLE_GAP_EVENT_CONN_UPDATE:
+      // The central (Chrome/OS) often renegotiates interval/timeout shortly
+      // after connecting; log the new values so we see what we actually got.
+      ESP_LOGI(TAG, "conn update (status=%d)", ev->conn_update.status);
+      log_conn_params(ev->conn_update.conn_handle, "updated params");
+      break;
     case BLE_GAP_EVENT_SUBSCRIBE:
       if (ev->subscribe.attr_handle == h_record) {
         record_subscribed = ev->subscribe.cur_notify != 0;
+        ESP_LOGI(TAG, "record notifications %s", record_subscribed ? "ENABLED" : "disabled");
       }
       break;
     case BLE_GAP_EVENT_MTU:
       ESP_LOGI(TAG, "MTU updated to %d", ev->mtu.value);
       break;
     default:
+      ESP_LOGD(TAG, "unhandled GAP event type=%d", ev->type);
       break;
   }
   return 0;
@@ -381,7 +410,15 @@ void ble_publisher(void* params) {
 
     if (curr_conn != 0xffff && record_subscribed) {
       struct os_mbuf* om = ble_hs_mbuf_from_flat(local_buf, n);
-      if (om) ble_gatts_notify_custom(curr_conn, h_record, om);
+      if (!om) {
+        // mbuf pool exhausted — notifies aren't draining. A sustained run of
+        // this just before a disconnect points at the host running out of
+        // buffers rather than a radio/timeout problem.
+        ESP_LOGW(TAG, "notify skipped: mbuf alloc failed (seq %lu)", (unsigned long)r.seq_no);
+      } else {
+        int rc = ble_gatts_notify_custom(curr_conn, h_record, om);
+        if (rc != 0) ESP_LOGW(TAG, "notify failed: rc=%d (seq %lu)", rc, (unsigned long)r.seq_no);
+      }
     }
   }
 }
