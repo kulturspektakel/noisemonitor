@@ -26,12 +26,12 @@ static const char* TAG = "audio_dsp";
 #define SIMULATE_MIC 0
 
 // --- I²S configuration --------------------------------------------------------
-// INMP441: standard I²S mic, 24-bit signed samples left-aligned in a 32-bit slot.
+// ICS-43434: standard I²S mic, 24-bit signed samples left-aligned in a 32-bit slot.
 // Tie L/R pin to GND for left channel (matches I2S_STD_SLOT_LEFT below).
 #define SAMPLE_RATE      48000
-#define I2S_BCLK_GPIO    GPIO_NUM_11   // SCK on the mic
-#define I2S_WS_GPIO      GPIO_NUM_9    // WS on the mic
-#define I2S_DATA_GPIO    GPIO_NUM_12   // SD on the mic
+#define I2S_BCLK_GPIO    GPIO_NUM_9    // SCK on the mic
+#define I2S_WS_GPIO      GPIO_NUM_10   // WS on the mic
+#define I2S_DATA_GPIO    GPIO_NUM_11   // SD on the mic
 #define I2S_BUFFER_FRAMES 1024         // per i2s_channel_read call
 
 // --- FFT configuration --------------------------------------------------------
