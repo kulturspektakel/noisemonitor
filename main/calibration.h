@@ -13,15 +13,15 @@
 // fixed FFT-energy->dB-SPL anchor now lives in audio_dsp.c, so calibration is
 // purely a per-band frequency-response + residual-sensitivity trim.
 
-// Read NVS, cache the per-band steps, set CALIBRATED if a calibration is stored.
+// Read NVS, cache the per-band steps if a calibration is stored.
 // Also erases the obsolete scalar-offset key from older firmware.
 void calibration_init(void);
 
-// Persist the 31 per-band steps to NVS, update the cache, set CALIBRATED, and
-// flag the DSP task to re-apply. n must equal CALIBRATION_BANDS.
+// Persist the 31 per-band steps to NVS, update the cache, and flag the DSP task
+// to re-apply. n must equal CALIBRATION_BANDS.
 esp_err_t calibration_set_bands(const int8_t* steps, size_t n);
 
-// Erase the stored calibration, zero the cache, clear CALIBRATED, flag re-apply.
+// Erase the stored calibration, zero the cache, flag re-apply.
 esp_err_t calibration_clear(void);
 
 // Copy the cached steps (0.5 dB units) — for the BLE read handler.

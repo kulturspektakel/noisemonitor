@@ -8,7 +8,6 @@
 #define DEVICE_ID_LOADED     BIT5
 #define SALT_LOADED          BIT6
 #define USB_CONNECTED        BIT7
-#define CALIBRATED           BIT8
 #define MQTT_CONNECTED       BIT10
 
 static const EventBits_t STARTUP_BITS = TIME_SET | DEVICE_ID_LOADED | SALT_LOADED;

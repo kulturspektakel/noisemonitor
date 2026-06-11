@@ -3,9 +3,6 @@
 #include <string.h>
 #include "constants.h"
 #include "esp_log.h"
-#include "event_group.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
 #include "nvs_flash.h"
 
 static const char* TAG = "calibration";
@@ -36,7 +33,6 @@ void calibration_init(void) {
   nvs_close(handle);
 
   if (err == ESP_OK && len == sizeof(band_steps)) {
-    xEventGroupSetBits(event_group, CALIBRATED);
     atomic_store(&band_dirty, true);
     ESP_LOGI(TAG, "per-band calibration loaded (%d bands)", CALIBRATION_BANDS);
     return;
@@ -65,7 +61,6 @@ esp_err_t calibration_set_bands(const int8_t* steps, size_t n) {
 
   memcpy(band_steps, steps, n);
   atomic_store(&band_dirty, true);
-  xEventGroupSetBits(event_group, CALIBRATED);
   return ESP_OK;
 }
 
@@ -82,7 +77,6 @@ esp_err_t calibration_clear(void) {
 
   memset(band_steps, 0, sizeof(band_steps));
   atomic_store(&band_dirty, true);
-  xEventGroupClearBits(event_group, CALIBRATED);
   return err;
 }
 

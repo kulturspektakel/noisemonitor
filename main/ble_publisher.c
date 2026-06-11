@@ -104,8 +104,7 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
       // automatic on iOS/Android, and NimBLE's preferred MTU is 256. (If a
       // client never raises MTU past the 23-byte default it falls back to a
       // Long Write, which NimBLE reassembles into one mbuf for this callback.)
-      // Read returns the current 31 bytes; write persists to NVS and sets the
-      // CALIBRATED event bit (so the status LED leaves red).
+      // Read returns the current 31 bytes; write persists to NVS.
       { .uuid = &chr_cal_uuid.u, .access_cb = access_cal,
         .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_WRITE, .val_handle = &h_cal },
       // WiFi credentials, write-only. Payload format:

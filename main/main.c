@@ -86,7 +86,7 @@ void app_main(void) {
   // service must be installed before any task adds a handler.
   gpio_install_isr_service(ESP_INTR_FLAG_EDGE);
 
-  // Load persisted per-band calibration + set CALIBRATED bit if present.
+  // Load persisted per-band calibration if present.
   // Uncalibrated devices start with all-zero band offsets and still read near
   // dB SPL thanks to the fixed FFT-energy->dB-SPL anchor in audio_dsp.c; the
   // operator trims the per-band frequency response via the BLE calibration
