@@ -224,6 +224,5 @@ void power_management(void* params) {
     }
 
     ESP_LOGI(POWER_MANAGEMENT_TASK, "USB %dmV, battery %dmV", usb_voltage, battery_voltage);
-    xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
   }
 }

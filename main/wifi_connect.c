@@ -12,35 +12,24 @@
 #include "power_management.h"
 
 static TimerHandle_t update_timer;
-int8_t wifi_rssi = INT8_MIN;
 wifi_status_t wifi_status = DISCONNECTED;
 
-static void update_signal_strength() {
-  wifi_ap_record_t wifidata;
-  esp_wifi_sta_get_ap_info(&wifidata);
-  wifi_rssi = wifidata.rssi;
-  xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
-}
-
+// Retry cadence while disconnected: faster on USB power, slower on battery.
+// The timer only runs while disconnected (disconnects are event-driven), so
+// there's no connected-state case to handle here.
 static int timer_duration() {
-  bool is_connected = xEventGroupGetBits(event_group) & WIFI_CONNECTED;
   bool usb_connected = xEventGroupGetBits(event_group) & USB_CONNECTED;
-  if (is_connected) {
-    return 10000;
-  } else if (usb_connected) {
-    return 60000 * 2;
-  } else {
-    return 60000 * 5;
-  }
+  return usb_connected ? 60000 * 2 : 60000 * 5;
 }
 
 static void timer_cb(TimerHandle_t timer) {
   bool is_connected = xEventGroupGetBits(event_group) & WIFI_CONNECTED;
   if (is_connected) {
-    update_signal_strength();
-  } else {
-    vTaskNotifyGiveFromISR(xTaskGetHandle(WIFI_CONNECT_TASK), NULL);
+    // A retry succeeded between scheduling and firing — stop; the next
+    // disconnect event will restart the timer.
+    return;
   }
+  vTaskNotifyGiveFromISR(xTaskGetHandle(WIFI_CONNECT_TASK), NULL);
   xTimerChangePeriod(timer, pdMS_TO_TICKS(timer_duration()), 0);
   xTimerReset(timer, 0);
 }
@@ -88,12 +77,10 @@ static void event_handler(
     // churn returns, fall back to WIFI_PS_NONE (we publish to MQTT every 1 s
     // anyway, so true idle is rare on a real router).
     esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
-    update_signal_strength();
     xEventGroupSetBits(event_group, WIFI_CONNECTED);
     xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eNoAction);
-    startTimer();
+    // No timer while connected: disconnects are event-driven and restart it.
   }
-  xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
 }
 
 static esp_err_t read_nvs_string(
@@ -163,12 +150,20 @@ void wifi_connect(void* params) {
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     ESP_LOGI(WIFI_CONNECT_TASK, "Trying to connect to WiFi...");
     wifi_status = CONNECTING;
-    xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
     clearTimer();
     // Bring the radio back up if a previous disconnect stopped it (§12).
     esp_wifi_start();
     esp_wifi_connect();
   }
+}
+
+void wifi_connect_trigger(void) {
+  // Skip if already connected or mid-connect: notifying during CONNECTING
+  // re-enters esp_wifi_connect() and the stack logs "sta is connecting,
+  // return error" (same reason the retry timer only notifies when down).
+  if (wifi_status == CONNECTED || wifi_status == CONNECTING) return;
+  TaskHandle_t h = xTaskGetHandle(WIFI_CONNECT_TASK);
+  if (h != NULL) xTaskNotifyGive(h);
 }
 
 esp_err_t wifi_connect_set_credentials(const char* ssid, const char* password) {

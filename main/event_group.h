@@ -4,7 +4,6 @@
 
 #define WIFI_CONNECTED       BIT2
 #define TIME_SET             BIT3
-#define DISPLAY_NEEDS_UPDATE BIT4
 #define DEVICE_ID_LOADED     BIT5
 #define SALT_LOADED          BIT6
 #define USB_CONNECTED        BIT7

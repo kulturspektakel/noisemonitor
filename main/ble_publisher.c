@@ -2,6 +2,8 @@
 #include "audio_dsp.h"
 #include "calibration.h"
 #include "esp_log.h"
+#include "log_uploader.h"
+#include "power_management.h"
 #include "wifi_connect.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -42,15 +44,32 @@ static const ble_uuid128_t noise_svc_uuid  = NOISE_UUID_BASE(0x00);
 static const ble_uuid128_t chr_record_uuid = NOISE_UUID_BASE(0x01);
 static const ble_uuid128_t chr_cal_uuid    = NOISE_UUID_BASE(0x02);
 static const ble_uuid128_t chr_wifi_uuid   = NOISE_UUID_BASE(0x03);
+static const ble_uuid128_t chr_uploads_uuid = NOISE_UUID_BASE(0x04);
+static const ble_uuid128_t chr_wifi_status_uuid = NOISE_UUID_BASE(0x05);
 
 // Value handles filled by the stack at GATT registration.
 static uint16_t h_record = 0;
 static uint16_t h_cal    = 0;
 static uint16_t h_wifi   = 0;
+static uint16_t h_batt   = 0;
+static uint16_t h_uploads = 0;
+static uint16_t h_wifi_status = 0;
 
 // Connection + subscription state.
 static volatile uint16_t curr_conn       = 0xffff;
 static volatile bool     record_subscribed = false;
+static volatile bool     batt_subscribed   = false;
+static volatile bool     uploads_subscribed = false;
+static volatile bool     wifi_status_subscribed = false;
+// Last battery percentage pushed via notify. 0xff = "none yet" sentinel (real
+// values are 0..100), forcing a fresh notify on (re)subscribe.
+static volatile uint8_t  batt_last_notified = 0xff;
+// Last pending-uploads count pushed via notify. -1 = "none yet" sentinel,
+// forcing a fresh notify on (re)subscribe.
+static volatile int      uploads_last_notified = -1;
+// Last wifi_status pushed via notify. 0xff = "none yet" sentinel (real values
+// are 0..2), forcing a fresh notify on (re)subscribe.
+static volatile uint8_t  wifi_status_last_notified = 0xff;
 
 // Cached encoding of the latest record. Used by the READ callback (NimBLE
 // host task) and refreshed by the publisher task after each notify. A mutex
@@ -75,6 +94,9 @@ static int read_record(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt
 static int read_dis_string(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 static int access_cal(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 static int write_wifi(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
+static int read_battery(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
+static int read_uploads(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
+static int read_wifi_status(uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg);
 
 // --- GATT service definition -------------------------------------------------
 static const struct ble_gatt_svc_def gatt_svcs[] = {
@@ -88,6 +110,17 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
         .arg = firmware_revision, .flags = BLE_GATT_CHR_F_READ },
       { .uuid = BLE_UUID16_DECLARE(0x2A25), .access_cb = read_dis_string,
         .arg = serial_number, .flags = BLE_GATT_CHR_F_READ },
+      { 0 },
+    },
+  },
+  {
+    .type = BLE_GATT_SVC_TYPE_PRIMARY,
+    .uuid = BLE_UUID16_DECLARE(0x180F),  // Battery Service (SIG standard)
+    .characteristics = (struct ble_gatt_chr_def[]) {
+      // Battery Level (0x2A19): single uint8 percentage, 0..100. Read returns
+      // the current battery_percentage(); notify pushes it when it changes.
+      { .uuid = BLE_UUID16_DECLARE(0x2A19), .access_cb = read_battery,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_batt },
       { 0 },
     },
   },
@@ -112,6 +145,14 @@ static const struct ble_gatt_svc_def gatt_svcs[] = {
       // ssid_len in 1..32, pw_len in 0..63 (0 = open network).
       { .uuid = &chr_wifi_uuid.u, .access_cb = write_wifi,
         .flags = BLE_GATT_CHR_F_WRITE, .val_handle = &h_wifi },
+      // Pending log uploads: read-only uint16 (little-endian) count of log
+      // files still waiting to be uploaded. Notifies when the count changes.
+      { .uuid = &chr_uploads_uuid.u, .access_cb = read_uploads,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_uploads },
+      // WiFi connection status: read-only uint8. 0 = disconnected,
+      // 1 = connecting, 2 = connected. Notifies when the state changes.
+      { .uuid = &chr_wifi_status_uuid.u, .access_cb = read_wifi_status,
+        .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_NOTIFY, .val_handle = &h_wifi_status },
       { 0 },
     },
   },
@@ -212,6 +253,50 @@ static int write_wifi(
   return 0;
 }
 
+// Battery percentage to report over BLE. On USB the discharge-curve percentage
+// is meaningless (the pack reads high while charging), so report 100% — same
+// on-battery gate as record_encode_single's battery_mv (usb_voltage <= 1000).
+static uint8_t battery_pct_ble(void) {
+  if (usb_voltage > 1000) return 100;
+  return (uint8_t)battery_percentage();  // 0..100
+}
+
+static int read_battery(
+    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
+) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+  uint8_t pct = battery_pct_ble();
+  return os_mbuf_append(ctxt->om, &pct, sizeof(pct)) == 0
+      ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+// Clamp the pending-uploads count into the uint16 wire range (negative shouldn't
+// happen — the uploader floors at 0 — but guard anyway).
+static uint16_t uploads_count_u16(void) {
+  int n = log_files_to_upload;
+  if (n < 0) n = 0;
+  if (n > 0xffff) n = 0xffff;
+  return (uint16_t)n;
+}
+
+static int read_uploads(
+    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
+) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+  uint16_t n = uploads_count_u16();  // little-endian on the ESP32
+  return os_mbuf_append(ctxt->om, &n, sizeof(n)) == 0
+      ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+static int read_wifi_status(
+    uint16_t conn, uint16_t attr, struct ble_gatt_access_ctxt* ctxt, void* arg
+) {
+  if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_UNLIKELY;
+  uint8_t s = (uint8_t)wifi_status;  // 0=disconnected, 1=connecting, 2=connected
+  return os_mbuf_append(ctxt->om, &s, sizeof(s)) == 0
+      ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
 // --- GAP --------------------------------------------------------------------
 static uint8_t own_addr_type;
 static char    adv_name[24];
@@ -287,6 +372,9 @@ static int gap_event(struct ble_gap_event* ev, void* arg) {
         curr_conn = ev->connect.conn_handle;
         ESP_LOGI(TAG, "BLE client connected");
         log_conn_params(curr_conn, "connect params");
+        // A client attaching is a good moment to try WiFi (e.g. someone is
+        // provisioning or checking on the device). No-op if already connected.
+        wifi_connect_trigger();
       } else {
         ESP_LOGW(TAG, "connect failed (status=%d); re-advertising", ev->connect.status);
         start_advertising();
@@ -300,6 +388,9 @@ static int gap_event(struct ble_gap_event* ev, void* arg) {
                ev->disconnect.reason, ev->disconnect.reason);
       curr_conn = 0xffff;
       record_subscribed = false;
+      batt_subscribed = false;
+      uploads_subscribed = false;
+      wifi_status_subscribed = false;
       start_advertising();
       break;
     case BLE_GAP_EVENT_CONN_UPDATE:
@@ -312,6 +403,21 @@ static int gap_event(struct ble_gap_event* ev, void* arg) {
       if (ev->subscribe.attr_handle == h_record) {
         record_subscribed = ev->subscribe.cur_notify != 0;
         ESP_LOGI(TAG, "record notifications %s", record_subscribed ? "ENABLED" : "disabled");
+      } else if (ev->subscribe.attr_handle == h_batt) {
+        batt_subscribed = ev->subscribe.cur_notify != 0;
+        // Force the next drain iteration to push the current level.
+        batt_last_notified = 0xff;
+        ESP_LOGI(TAG, "battery notifications %s", batt_subscribed ? "ENABLED" : "disabled");
+      } else if (ev->subscribe.attr_handle == h_uploads) {
+        uploads_subscribed = ev->subscribe.cur_notify != 0;
+        // Force the next drain iteration to push the current count.
+        uploads_last_notified = -1;
+        ESP_LOGI(TAG, "uploads notifications %s", uploads_subscribed ? "ENABLED" : "disabled");
+      } else if (ev->subscribe.attr_handle == h_wifi_status) {
+        wifi_status_subscribed = ev->subscribe.cur_notify != 0;
+        // Force the next drain iteration to push the current state.
+        wifi_status_last_notified = 0xff;
+        ESP_LOGI(TAG, "wifi-status notifications %s", wifi_status_subscribed ? "ENABLED" : "disabled");
       }
       break;
     case BLE_GAP_EVENT_MTU:
@@ -418,6 +524,43 @@ void ble_publisher(void* params) {
       } else {
         int rc = ble_gatts_notify_custom(curr_conn, h_record, om);
         if (rc != 0) ESP_LOGW(TAG, "notify failed: rc=%d (seq %lu)", rc, (unsigned long)r.seq_no);
+      }
+    }
+
+    // Battery level: notify only when the percentage changes (it moves slowly,
+    // so this is near-silent). Piggybacks on the 1 s record cadence rather than
+    // running its own timer.
+    if (curr_conn != 0xffff && batt_subscribed) {
+      uint8_t pct = battery_pct_ble();
+      if (pct != batt_last_notified) {
+        struct os_mbuf* om = ble_hs_mbuf_from_flat(&pct, sizeof(pct));
+        if (om && ble_gatts_notify_custom(curr_conn, h_batt, om) == 0) {
+          batt_last_notified = pct;
+        }
+      }
+    }
+
+    // Pending uploads: notify when the count changes (uploads drain and new log
+    // files rotate in slowly relative to the 1 s cadence, so this is quiet).
+    if (curr_conn != 0xffff && uploads_subscribed) {
+      int n = log_files_to_upload;
+      if (n != uploads_last_notified) {
+        uint16_t v = uploads_count_u16();
+        struct os_mbuf* om = ble_hs_mbuf_from_flat(&v, sizeof(v));
+        if (om && ble_gatts_notify_custom(curr_conn, h_uploads, om) == 0) {
+          uploads_last_notified = n;
+        }
+      }
+    }
+
+    // WiFi connection status: notify when the state changes.
+    if (curr_conn != 0xffff && wifi_status_subscribed) {
+      uint8_t s = (uint8_t)wifi_status;
+      if (s != wifi_status_last_notified) {
+        struct os_mbuf* om = ble_hs_mbuf_from_flat(&s, sizeof(s));
+        if (om && ble_gatts_notify_custom(curr_conn, h_wifi_status, om) == 0) {
+          wifi_status_last_notified = s;
+        }
       }
     }
   }

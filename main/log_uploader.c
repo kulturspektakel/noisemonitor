@@ -138,7 +138,6 @@ void log_uploader(void* params) {
 
   // initial value
   log_files_to_upload = update_log_count();
-  xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
   if (log_files_to_upload > 0) {
     xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eNoAction);
   }
@@ -148,7 +147,6 @@ void log_uploader(void* params) {
     uint32_t increment = 0;
     xTaskNotifyWait(0, ULONG_MAX, &increment, portMAX_DELAY);
     log_files_to_upload += increment;
-    xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
 
     // Gate on MQTT being up, not just WiFi: at boot MQTT's TLS handshake
     // grabs a contiguous mbedtls IN+OUT buffer pair (~8 KB), and if we
@@ -188,7 +186,6 @@ void log_uploader(void* params) {
             if (log_files_to_upload < 0) {
               log_files_to_upload = 0;
             }
-            xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
           }
           break;
         case HTTP_ISSUE:
@@ -206,7 +203,6 @@ void log_uploader(void* params) {
 
     if (log_files_to_upload > 0) {
       log_files_to_upload = update_log_count();
-      xEventGroupSetBits(event_group, DISPLAY_NEEDS_UPDATE);
     }
 
     if (log_files_to_upload > 0) {
