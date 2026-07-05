@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <time.h>
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -10,16 +11,24 @@
 
 #define NOISE_BANDS 31
 
-// Per-second measurement payload. Fields use the spec §5 encoding:
+// One measurement record. Fields use the spec §5 encoding:
 //   byte_value = round((dB - 20.0) * 2.0)
+// A record spans 1 s (live MQTT/BLE) or RECORD_INTERVAL_SECONDS (on-disk
+// aggregate) — hence no `_1s` suffix; the span is carried on the wire in
+// NoiseRecording.record_interval_seconds.
 typedef struct {
   uint32_t seq_no;
   uint8_t  bands[NOISE_BANDS];
-  uint8_t  laeq_1s;
-  uint8_t  lceq_1s;
-  uint8_t  lafmax_1s;
-  uint8_t  lcfmax_1s;
-  uint8_t  lcpeak_1s;
+  uint8_t  laeq;
+  uint8_t  lceq;
+  uint8_t  lafmax;
+  uint8_t  lcfmax;
+  uint8_t  lcpeak;
+  // Wall-clock start of this record's measurement window. Set by the producer
+  // (audio_dsp) so downstream consumers timestamp from when the measurement
+  // was taken, not when they happen to dequeue it. Only the on-disk log path
+  // reads it; the live 1 s records leave it at their emit time / unused.
+  time_t   window_start;
 } record_t;
 
 extern QueueHandle_t record_writer_queue;
@@ -55,11 +64,16 @@ void audio_dsp_get_aggregates(audio_dsp_aggregates_t* out);
 // in mqtt_publisher / ble_publisher / record_writer so adding/removing fields
 // only touches one place.
 
-// Copy the per-second fields of `r` into the protobuf Record slot
-// (NoiseRecording.Record).
-void record_to_pb(const record_t* r, NoiseRecording_Record* out);
+// Copy the measurement fields of `r` into a (flattened) NoiseRecording.
+// Does NOT set record_interval_seconds / battery / rolling windows — the
+// caller sets those for its context.
+void record_to_pb(const record_t* r, NoiseRecording* out);
 
-// Encode `r` as a single-Record NoiseRecording, snapshotting the current
-// LAeq_15m window value. Returns bytes written to `out`, or 0 on failure.
-// Used by MQTT and BLE which both publish one record per message.
+// Stamp the current 5m/30m rolling-window Leqs onto `out` (has_ flags follow
+// the ring-full gate). Shared by the live and on-disk encoders.
+void record_apply_aggregates(NoiseRecording* out);
+
+// Encode `r` as a live NoiseRecording (record_interval_seconds = 1), attaching
+// battery + the current 5m/30m windows. Returns bytes written to `out`, or 0
+// on failure. Used by MQTT and BLE.
 size_t record_encode_single(const record_t* r, uint8_t* out, size_t cap);

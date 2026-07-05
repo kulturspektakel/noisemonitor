@@ -123,9 +123,8 @@ void app_main(void) {
   xTaskCreate(&load_device_id,   "load_device_id",      3072, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&load_salt,        "load_salt",           3072, NULL, TASK_PRIO_NORMAL, NULL);
 
-  // 4096 stack-overflowed during flush_to_file at 300 records: pb_encode
-  // recurses over the noise_recording submessage, then esp_littlefs_info
-  // + LittleFS write/commit on the same stack pushed it past the canary.
+  // 6144 (not 4096): flush_to_file's pb_encode plus esp_littlefs_info and the
+  // LittleFS write/commit share this stack; 4096 overflowed the canary.
   xTaskCreate(&record_writer,    "record_writer",       6144, NULL, TASK_PRIO_NORMAL, NULL);
 
   // New

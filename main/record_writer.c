@@ -16,24 +16,14 @@
 #include "power_management.h"
 
 #define HEADROOM_BYTES (200 * 1024)
-// 300 records → ~5 minutes per file.
-#define RECORDS_PER_FILE 300
 
 static const char* TAG = "record_writer";
 static const char* ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-// Static BSS allocation (~13 KB at 300 records). Keeps this big buffer out
-// of the heap pool entirely — no fragmentation contribution, no risk of
-// failed lazy alloc after WiFi/BLE init. Zero-initialized at boot; fields
-// are explicitly rewritten in flush_to_file() on every batch.
+// Static BSS staging for the one-record LogMessage. Tiny now that
+// NoiseRecording is flattened (no records[] array); kept in BSS to stay out of
+// the heap pool. Fields are rewritten in flush_to_file() on every write.
 static LogMessage log_message_buf;
-static int records_count = 0;
-// Wall-clock time of records[0] in the current batch, captured when the
-// batch starts (records_count transitions 0 → 1). The server treats
-// `device_time` as the timestamp of the first record, so stamping it at
-// flush time (~5 min later) would shift every measuredAt into the future.
-static time_t first_record_time = 0;
-
 static bool write_pb_to_file(pb_ostream_t* stream, const uint8_t* buf, size_t count) {
   return fwrite(buf, 1, count, (FILE*)stream->state) == count;
 }
@@ -98,27 +88,20 @@ static void generate_client_id(char* dst, size_t dst_size) {
   dst[n] = '\0';
 }
 
-static void flush_to_file(void) {
+static void flush_to_file(time_t window_start) {
   strlcpy(log_message_buf.device_id, DEVICE_ID, sizeof(log_message_buf.device_id));
   generate_client_id(log_message_buf.client_id, sizeof(log_message_buf.client_id));
-  log_message_buf.device_time = (int32_t)first_record_time;
+  // device_time is the measurement window's start, captured by the producer
+  // (audio_dsp) — robust to any queue latency between produce and flush.
+  log_message_buf.device_time = (int32_t)window_start;
   log_message_buf.device_time_is_utc = true;
   log_message_buf.has_battery_voltage = true;
   log_message_buf.battery_voltage = battery_voltage;
   log_message_buf.has_usb_voltage = true;
   log_message_buf.usb_voltage = usb_voltage;
   log_message_buf.has_noise_recording = true;
-  log_message_buf.noise_recording.records_count = records_count;
-  audio_dsp_aggregates_t agg;
-  audio_dsp_get_aggregates(&agg);
-  log_message_buf.noise_recording.has_laeq_5m  = agg.has_5m;
-  log_message_buf.noise_recording.has_lceq_5m  = agg.has_5m;
-  log_message_buf.noise_recording.laeq_5m      = agg.laeq_5m;
-  log_message_buf.noise_recording.lceq_5m      = agg.lceq_5m;
-  log_message_buf.noise_recording.has_laeq_30m = agg.has_30m;
-  log_message_buf.noise_recording.has_lceq_30m = agg.has_30m;
-  log_message_buf.noise_recording.laeq_30m     = agg.laeq_30m;
-  log_message_buf.noise_recording.lceq_30m     = agg.lceq_30m;
+  log_message_buf.noise_recording.record_interval_seconds = RECORD_INTERVAL_SECONDS;
+  record_apply_aggregates(&log_message_buf.noise_recording);
 
   char filename[256];
   snprintf(
@@ -129,14 +112,13 @@ static void flush_to_file(void) {
       (long)log_message_buf.device_time,
       log_message_buf.client_id
   );
-  ESP_LOGI(TAG, "Writing log file %s (%d records)", filename, records_count);
+  ESP_LOGI(TAG, "Writing log file %s", filename);
 
   ensure_free_space();
 
   FILE* file = fopen(filename, "w");
   if (file == NULL) {
     ESP_LOGE(TAG, "Failed to open %s for writing", filename);
-    records_count = 0;
     return;
   }
 
@@ -157,7 +139,6 @@ static void flush_to_file(void) {
     TaskHandle_t uploader = xTaskGetHandle(LOG_UPLOADER_TASK);
     if (uploader) xTaskNotify(uploader, 0, eIncrement);
   }
-  records_count = 0;
 }
 
 void record_writer(void* params) {
@@ -167,13 +148,9 @@ void record_writer(void* params) {
     record_t r;
     if (xQueueReceive(record_writer_queue, &r, portMAX_DELAY) != pdTRUE) continue;
 
-    if (records_count == 0) {
-      first_record_time = time(NULL);
-    }
-    record_to_pb(&r, &log_message_buf.noise_recording.records[records_count]);
-    records_count++;
-    if (records_count >= RECORDS_PER_FILE) {
-      flush_to_file();
-    }
+    // One aggregate record per file, flushed immediately for power-loss
+    // durability (see RECORD_INTERVAL_SECONDS in constants.h).
+    record_to_pb(&r, &log_message_buf.noise_recording);
+    flush_to_file(r.window_start);
   }
 }

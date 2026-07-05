@@ -86,8 +86,8 @@ void mqtt_publisher(void* params) {
     } else {
       ESP_LOGI(TAG, "published seq=%lu LAeq=%.1f LCpeak=%.1f",
                (unsigned long)r.seq_no,
-               20.0f + r.laeq_1s / 2.0f,
-               20.0f + r.lcpeak_1s / 2.0f);
+               20.0f + r.laeq / 2.0f,
+               20.0f + r.lcpeak / 2.0f);
     }
   }
 }

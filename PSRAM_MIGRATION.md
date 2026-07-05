@@ -16,6 +16,16 @@ memory-driven and should stay.
 > pre-reverted — see the **Done early** tags below. When the PSRAM
 > board lands the remaining work is just: enable SPIRAM, tag the big
 > BSS arrays `EXT_RAM_BSS_ATTR`, and remove the `DEV_NO_BLE` define.
+>
+> **Update (2026-07):** `NoiseRecording` was flattened (the nested `Record`
+> submessage was removed; its fields live directly on `NoiseRecording`) and
+> on-disk logs now store **one energy-aggregated record per minute** instead
+> of up to 300 per-second records. `NoiseRecording_size` fell from 16816 to
+> **73 bytes**, which freed **~15.6 KB of internal BSS** and made items **1**
+> and **9** below doable *without* PSRAM — both are now done (see their tags).
+> That freed BSS is also enough headroom to bump `RING_30M` back to 1800
+> (restore the 30-min average) pre-PSRAM — but only if it isn't spent on a
+> BLE-coexistence attempt instead.
 
 ## TL;DR — the one-line revert to get the 30-min average back
 
@@ -34,16 +44,17 @@ as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
 
 ## Section 1 — Revert with PSRAM
 
-### 1. `record_encode_single` stream-encoder
-- **Where:** `main/audio_dsp.c:390`
-- **What:** Manual `pb_encode_tag` + `pb_encode_submessage` + `pb_encode_varint`
-  calls field-by-field, with hard-coded field numbers (2, 5, 6, 7, 8, 9).
-- **Why:** A stack-allocated `NoiseRecording` at `max_count:300` is ~12 KB
-  and overflows the 4 KB BLE/MQTT publisher task stacks.
-- **Revert:** Stage a `NoiseRecording` on heap (in PSRAM) and use plain
-  `pb_encode(&stream, NoiseRecording_fields, &msg)`.
-- **Benefit:** Drops ~40 lines of fragile encoding; field changes in
-  `noise.proto` no longer require touching this function.
+### 1. `record_encode_single` stream-encoder — **Done (flattened proto, no PSRAM)**
+- **Status:** Reverted. `record_encode_single` (`main/audio_dsp.c`) now stages a
+  whole `NoiseRecording` on the stack and calls plain
+  `pb_encode(&stream, NoiseRecording_fields, &rec)`. The manual field-by-field
+  `pb_encode_tag`/`pb_encode_submessage`/`pb_encode_varint` chain (and the
+  hard-coded field numbers) is gone; the 5m/30m stamping moved to the shared
+  `record_apply_aggregates()` helper.
+- **Why it was safe now (not PSRAM):** flattening removed the nested `Record`
+  submessage and dropped the record array from `max_count:300` to a single
+  record, so a stack-allocated `NoiseRecording` is only 73 bytes — no risk to
+  the 4 KB publisher task stacks.
 
 ### 2. `audio_dsp_preinit()` hook + early FFT-table allocation
 - **Where:** `main/main.c:41-47`, `main/audio_dsp.c:240`
@@ -91,13 +102,25 @@ as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
 - **Why it was safe to remove now:** BLE off → pools aren't allocated.
   When BLE comes back together with PSRAM the defaults fit.
 
-### 7. mbedtls SSL buffers shrunk — **Done early**
-- **Status:** Restored. `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384`,
-  `CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384` (IDF defaults).
-- **Why it was safe to restore now:** BLE off frees ~80 KB of internal
-  heap; 32 KB of TLS buffers fits comfortably during a handshake. No
-  more `-0x7100`/`-0x7F00` surprises when a server presents a fatter
-  cert chain.
+### 7. mbedtls SSL buffers + dynamic buffer — **Done early (dynamic buffer added 2026-07)**
+- **Status:** `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384` /
+  `OUT_CONTENT_LEN=16384` (cert-chain-safe ceiling) **plus**
+  `CONFIG_MBEDTLS_DYNAMIC_BUFFER=y` — the buffers are allocated on demand
+  (~3 KB for our Let's Encrypt server) and freed when idle. This is the
+  committed `sdkconfig.defaults` (note: a local `sdkconfig` had drifted to
+  3072/2048 static — that drift is now removed; `sdkconfig` is gitignored so
+  `sdkconfig.defaults` is the source of truth).
+- **Why 16384 + dynamic instead of a static shrink:** keeps cert-chain safety
+  (no `-0x7100`) while making the ceiling nearly free, so a second concurrent
+  TLS session (HTTPS upload) has the best chance of fitting.
+- **BLE coexistence test result (2026-07):** with BLE re-enabled, WiFi + BLE +
+  MQTT-TLS + DSP + per-minute logging all run **stably** — but the HTTPS
+  backlog upload's *second* concurrent TLS handshake still fails with
+  **`-0x7F00` (SSL_ALLOC_FAILED)**, even with the dynamic buffer, because
+  MQTT's live TLS + the BLE controller leave too little heap for it. With BLE
+  off the same build uploads cleanly (HTTP 201) and `-0x7F00` never appears.
+  **Conclusion: `DEV_NO_BLE` stays until PSRAM** — the live path coexists, but
+  log uploads do not. Dynamic buffer is kept regardless (strict improvement).
 
 ### 8. LWIP TCP send/recv windows shrunk — **Done early**
 - **Status:** Restored. `CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760`,
@@ -106,15 +129,14 @@ as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
   will move to PSRAM via `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`.
 - **Benefit already realized:** ~2× HTTPS upload throughput today.
 
-### 9. `LogMessage log_message_buf` as static BSS
-- **Where:** `main/record_writer.c:29`
-- **What:** 12.5 KB struct, unconditionally reserved at link time.
-- **Why:** Originally `calloc`'d at flush time; the 12.5 KB alloc failed
-  after WiFi/BLE fragmented the heap.
-- **Revert (option A):** Tag `EXT_RAM_BSS_ATTR` to push it out of internal
-  RAM but keep BSS allocation.
-- **Revert (option B):** Go back to `calloc` (in PSRAM), free after flush.
-- **Benefit:** Dynamic sizing if `RECORDS_PER_FILE` changes later.
+### 9. `LogMessage log_message_buf` as static BSS — **Resolved (flattened proto)**
+- **Status:** No longer a memory concern. Flattening `NoiseRecording` and
+  writing one aggregated record per file dropped `log_message_buf`
+  (`main/record_writer.c`) from ~12.5 KB to ~60 bytes of BSS. It stays static
+  BSS — fine at this size — so the `EXT_RAM_BSS_ATTR` / `calloc-in-PSRAM`
+  reverts are moot. Nothing to do post-PSRAM.
+- **Note:** `RECORDS_PER_FILE` no longer exists (one record per file), so the
+  old "dynamic sizing" rationale is gone too.
 
 ### 10. WiFi RX/TX buffer counts — **Done early**
 - **Status:** Bumped. `CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=24`,
@@ -144,9 +166,9 @@ These are correct/legitimate decisions independent of heap pressure. Do
 | Per-bin A/C weighting tables (16 KB BSS) | Correctness — band-center weighting drifts up to 0.5 dB on broadband signal. Tag `EXT_RAM_BSS_ATTR` if you want them in PSRAM. |
 | `cached_buf[128]` in `ble_publisher.c` | One small static buffer for on-demand BLE reads. Trivial. |
 | Power management (`CONFIG_PM_ENABLE`, tickless idle, 160 MHz default) | Battery life, not memory. |
-| LittleFS partition layout + 300-record file batches | Storage, not memory. |
+| LittleFS partition layout + one-aggregated-record-per-file (per-minute) | Storage/durability, not memory. |
 | ANSI FFT variants instead of SIMD (`dsps_fft2r_fc32_ansi` not `_aes3`) | Independent bug in esp-dsp SIMD path (`im=1.6` artifact). Stay on ANSI until the upstream bug is fixed. |
-| `record_to_pb` helper | Single source of truth for `record_t → NoiseRecording_Record`. Code quality, not memory. |
+| `record_to_pb` / `record_apply_aggregates` helpers | Single source of truth for `record_t → NoiseRecording` and 5m/30m stamping. Code quality, not memory. |
 | `audio_dsp` reader + `fft_worker` task split (`audio_dsp.c`) | Decouples I²S read from FFT compute so the DMA pool can stay small and FFT slowdowns don't drop samples. Architectural; keep regardless of PSRAM. |
 | Wall-clock-paced `WORK_EMIT` (`audio_dsp.c`, `next_emit_us`) | Pins record emission to 1 Hz wall clock instead of sample count. Correctness for server-side `measuredAt` reconstruction; keep regardless of PSRAM. |
 
@@ -170,10 +192,10 @@ These are correct/legitimate decisions independent of heap pressure. Do
    the real `ble_publisher` task. Items 4, 5, 6, 7, 8, 10 are already
    pre-reverted, so re-enabling BLE on the PSRAM heap should Just Work.
 
-3. **Commit 3 — structural reverts that need PSRAM:** items 1, 2, 9
-   (stream encoder → heap-staged `NoiseRecording`; drop the
-   `audio_dsp_preinit()` hook; `LogMessage log_message_buf` →
-   `EXT_RAM_BSS_ATTR`).
+3. **Commit 3 — structural reverts that need PSRAM:** item 2 only
+   (drop the `audio_dsp_preinit()` hook + early FFT-table allocation).
+   Items 1 and 9 are already done — the proto flattening (2026-07)
+   made both doable without PSRAM.
 
 4. **Optional later — item 3:** radix-4 FFT. Measure DSP utilization
    before/after; only worth doing if you want the extra idle time.

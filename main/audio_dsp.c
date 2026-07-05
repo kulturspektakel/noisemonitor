@@ -171,6 +171,22 @@ static float    hann_window[FFT_SIZE];
 
 static uint32_t seq_no = 0;
 
+// --- On-disk minute aggregation ----------------------------------------------
+// The file log stores ONE energy-aggregated record per RECORD_INTERVAL_SECONDS
+// (see constants.h). These accumulate the per-second values; at the interval
+// boundary we emit one aggregate record_t to record_writer_queue only. MQTT/BLE
+// keep getting the per-second record every second. Aggregation is in the energy
+// (linear) domain for the Leqs and bands; peaks take the interval max.
+static double   min_laeq_energy_sum = 0.0;
+static double   min_lceq_energy_sum = 0.0;
+static double   min_band_energy_sum[NOISE_BANDS];  // linear, pre-anchor
+static float    min_lafmax_db = 0.0f;
+static float    min_lcfmax_db = 0.0f;
+static float    min_lcpeak_db = 0.0f;
+static int      min_seconds_count = 0;
+static uint32_t minute_seq_no = 0;
+static time_t   min_window_start = 0;  // wall-clock time of this interval's first second
+
 #if SIMULATE_MIC
 // Four tones at frequencies spread across the 1/3-octave bands, each with its
 // own slow LFO modulating its amplitude. The LFO periods are coprime so the
@@ -495,54 +511,48 @@ void audio_dsp_get_aggregates(audio_dsp_aggregates_t* out) {
 }
 
 // --- Shared record → protobuf helpers ----------------------------------------
-void record_to_pb(const record_t* r, NoiseRecording_Record* out) {
+void record_to_pb(const record_t* r, NoiseRecording* out) {
   out->seq_no = r->seq_no;
   memcpy(out->bands, r->bands, sizeof(r->bands));
-  out->laeq_1s   = r->laeq_1s;
-  out->lceq_1s   = r->lceq_1s;
-  out->lafmax_1s = r->lafmax_1s;
-  out->lcfmax_1s = r->lcfmax_1s;
-  out->lcpeak_1s = r->lcpeak_1s;
+  out->laeq   = r->laeq;
+  out->lceq   = r->lceq;
+  out->lafmax = r->lafmax;
+  out->lcfmax = r->lcfmax;
+  out->lcpeak = r->lcpeak;
+}
+
+// Stamp the current 5m/30m rolling-window Leqs onto `out`. has_ flags follow
+// the ring-full gate (a partial window would average fewer seconds than the
+// field implies). Shared by the live (MQTT/BLE) and on-disk encoders.
+void record_apply_aggregates(NoiseRecording* out) {
+  audio_dsp_aggregates_t agg;
+  audio_dsp_get_aggregates(&agg);
+  out->has_laeq_5m  = agg.has_5m;  out->laeq_5m  = agg.laeq_5m;
+  out->has_lceq_5m  = agg.has_5m;  out->lceq_5m  = agg.lceq_5m;
+  out->has_laeq_30m = agg.has_30m; out->laeq_30m = agg.laeq_30m;
+  out->has_lceq_30m = agg.has_30m; out->lceq_30m = agg.lceq_30m;
 }
 
 size_t record_encode_single(const record_t* r, uint8_t* out, size_t cap) {
-  // Stream the NoiseRecording without staging the full struct: with
-  // max_count:300 a stack-allocated NoiseRecording is ~12 KB and overflows
-  // the 4 KB publisher task stacks. Only the single sub-Record is staged
-  // here (40 bytes).
-  NoiseRecording_Record sub;
-  record_to_pb(r, &sub);
-
-  audio_dsp_aggregates_t agg;
-  audio_dsp_get_aggregates(&agg);
-
-  pb_ostream_t stream = pb_ostream_from_buffer(out, cap);
-  if (!pb_encode_tag(&stream, PB_WT_STRING, 2)) goto fail;
-  if (!pb_encode_submessage(&stream, NoiseRecording_Record_fields, &sub)) goto fail;
+  // The flattened NoiseRecording is tiny (~50 B), so we can stage and encode
+  // the whole message on the stack — no more field-by-field hand-encoding.
+  NoiseRecording rec = NoiseRecording_init_zero;
+  record_to_pb(r, &rec);
+  rec.record_interval_seconds = 1;  // live per-second sample
 
   // battery_mv is only meaningful off-USB; skip when charging.
   if (usb_voltage <= 1000 && battery_voltage > 0) {
-    if (!pb_encode_tag(&stream, PB_WT_VARINT, 5)) goto fail;
-    if (!pb_encode_varint(&stream, (uint64_t)battery_voltage)) goto fail;
+    rec.has_battery_mv = true;
+    rec.battery_mv = (uint32_t)battery_voltage;
   }
-  // 5m/30m windows are emitted only when their ring is fully populated —
-  // a partial average would be over fewer seconds than the field name implies.
-  if (agg.has_5m) {
-    if (!pb_encode_tag(&stream, PB_WT_VARINT, 6)) goto fail;
-    if (!pb_encode_varint(&stream, agg.laeq_5m))  goto fail;
-    if (!pb_encode_tag(&stream, PB_WT_VARINT, 7)) goto fail;
-    if (!pb_encode_varint(&stream, agg.lceq_5m))  goto fail;
-  }
-  if (agg.has_30m) {
-    if (!pb_encode_tag(&stream, PB_WT_VARINT, 8)) goto fail;
-    if (!pb_encode_varint(&stream, agg.laeq_30m)) goto fail;
-    if (!pb_encode_tag(&stream, PB_WT_VARINT, 9)) goto fail;
-    if (!pb_encode_varint(&stream, agg.lceq_30m)) goto fail;
+  record_apply_aggregates(&rec);
+
+  pb_ostream_t stream = pb_ostream_from_buffer(out, cap);
+  if (!pb_encode(&stream, NoiseRecording_fields, &rec)) {
+    ESP_LOGW(TAG, "record_encode_single: %s", stream.errmsg);
+    return 0;
   }
   return stream.bytes_written;
-fail:
-  ESP_LOGW(TAG, "record_encode_single: %s", stream.errmsg);
-  return 0;
 }
 
 // --- Per-second emission -----------------------------------------------------
@@ -617,21 +627,63 @@ static void emit_per_second(float peak_abs) {
           : 0.0;
       float db = (mean > 0.0) ? 10.0f * log10f((float)mean) + fft_energy_to_spl_db : 0.0f;
       r.bands[b] = encode_db_to_byte(db);
+      // Accumulate the per-second linear band energy for the minute average.
+      // `mean` is already that linear value (computed above), so there's no
+      // pow() to reconstruct it; the constant SPL anchor is added once at emit.
+      min_band_energy_sum[b] += mean;
     }
-    r.laeq_1s   = encode_db_to_byte(laeq_db);
-    r.lceq_1s   = encode_db_to_byte(lceq_db);
-    r.lafmax_1s = encode_db_to_byte(lafmax_db);
-    r.lcfmax_1s = encode_db_to_byte(lcfmax_db);
-    r.lcpeak_1s = encode_db_to_byte(lcpeak_db);
+    r.laeq   = encode_db_to_byte(laeq_db);
+    r.lceq   = encode_db_to_byte(lceq_db);
+    r.lafmax = encode_db_to_byte(lafmax_db);
+    r.lcfmax = encode_db_to_byte(lcfmax_db);
+    r.lcpeak = encode_db_to_byte(lcpeak_db);
 
-    if (xQueueSend(record_writer_queue, &r, 0) != pdTRUE) {
-      ESP_LOGW(TAG, "record_writer_queue full, dropping record %lu", (unsigned long)r.seq_no);
-    }
+    // Live 1 Hz fan-out to MQTT + BLE (cadence unchanged).
     if (xQueueSend(mqtt_publisher_queue, &r, 0) != pdTRUE) {
       ESP_LOGW(TAG, "mqtt_publisher_queue full, dropping record %lu", (unsigned long)r.seq_no);
     }
     if (xQueueSend(ble_publisher_queue, &r, 0) != pdTRUE) {
       ESP_LOGW(TAG, "ble_publisher_queue full, dropping record %lu", (unsigned long)r.seq_no);
+    }
+
+    // On-disk log: accumulate this second, emit ONE aggregate to record_writer
+    // every RECORD_INTERVAL_SECONDS so a power loss costs at most one interval.
+    if (min_seconds_count == 0) min_window_start = time(NULL);  // true window start
+    min_laeq_energy_sum += laeq_lin;      // linear energy (anchor baked in)
+    min_lceq_energy_sum += lceq_lin;
+    min_lafmax_db = fmaxf(min_lafmax_db, lafmax_db);  // peaks: max over interval
+    min_lcfmax_db = fmaxf(min_lcfmax_db, lcfmax_db);
+    min_lcpeak_db = fmaxf(min_lcpeak_db, lcpeak_db);
+    min_seconds_count++;
+
+    if (min_seconds_count >= RECORD_INTERVAL_SECONDS) {
+      record_t agg = { 0 };
+      agg.seq_no = minute_seq_no++;
+      agg.window_start = min_window_start;
+      for (int b = 0; b < NOISE_BANDS; b++) {
+        double m = min_band_energy_sum[b] / (double)min_seconds_count;
+        agg.bands[b] = (m > 0.0)
+            ? encode_db_to_byte(10.0f * log10f((float)m) + fft_energy_to_spl_db)
+            : 0;
+      }
+      agg.laeq   = leq_from_sum(min_laeq_energy_sum, min_seconds_count);
+      agg.lceq   = leq_from_sum(min_lceq_energy_sum, min_seconds_count);
+      agg.lafmax = encode_db_to_byte(min_lafmax_db);
+      agg.lcfmax = encode_db_to_byte(min_lcfmax_db);
+      agg.lcpeak = encode_db_to_byte(min_lcpeak_db);
+
+      if (xQueueSend(record_writer_queue, &agg, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "record_writer_queue full, dropping aggregate %lu",
+                 (unsigned long)agg.seq_no);
+      }
+
+      min_laeq_energy_sum = 0.0;
+      min_lceq_energy_sum = 0.0;
+      for (int b = 0; b < NOISE_BANDS; b++) min_band_energy_sum[b] = 0.0;
+      min_lafmax_db = 0.0f;
+      min_lcfmax_db = 0.0f;
+      min_lcpeak_db = 0.0f;
+      min_seconds_count = 0;
     }
   } else {
     ESP_LOGI(TAG, "waiting for time_set; current LAeq=%.1f LCeq=%.1f (mean band cal=%+.2f)",

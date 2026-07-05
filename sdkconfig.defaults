@@ -70,12 +70,17 @@ CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
-# mbedtls SSL buffers at IDF default. Anything smaller risks
-# MBEDTLS_ERR_SSL_BAD_INPUT_DATA (-0x7100) when a server's Certificate
-# record exceeds the limit (Let's Encrypt R12 chain measured at 2722 B,
-# headed up only).
+# mbedtls SSL buffers: keep the 16384 ceiling so a server Certificate record
+# never overflows the IN buffer (-0x7100; Let's Encrypt R12 chain measured at
+# 2722 B), but enable the dynamic buffer so that ceiling costs almost nothing.
+# MBEDTLS_DYNAMIC_BUFFER allocates the RX/TX buffers on demand (sized to the
+# actual record, ~3 KB for our server) and frees them — plus the peer cert —
+# when idle. That's what lets a second TLS session (HTTPS upload) coexist with
+# MQTT's TLS *and* BLE on the no-PSRAM board; at a static 16384 the second
+# session couldn't find a contiguous buffer with BLE resident.
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 
 # Power management — dynamic frequency scaling only. Light sleep is off
 # (esp_pm_configure() in main.c sets light_sleep_enable=false): continuous

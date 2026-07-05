@@ -15,6 +15,11 @@
 #define TASK_PRIO_NORMAL 5
 #define TASK_PRIO_HIGH 10
 
+// On-disk log cadence: one aggregated record is written per this many seconds,
+// so a power loss drops at most the current in-progress interval. MQTT/BLE stay
+// at 1 Hz regardless. Signalled to the server via NoiseRecording.record_interval_seconds.
+#define RECORD_INTERVAL_SECONDS 60
+
 #define LOG_UPLOADER_TASK "log_uploader"
 #define WIFI_CONNECT_TASK "wifi_connect"
 #define POWER_MANAGEMENT_TASK "power_mgmt"

@@ -11,6 +11,13 @@
 
 #define MAX_ERRORS 3
 
+// New per-minute log files are a single aggregated record (~150 bytes).
+// Pre-aggregation files held up to 300 per-second records (~14.6 KB) and can't
+// be buffered for upload under WiFi+BLE memory pressure. Anything at/above this
+// is a legacy file — delete it instead of retrying the (failing) big alloc
+// forever. Doubles as an upper bound on the upload malloc below.
+#define LEGACY_LOG_SIZE_THRESHOLD 1024
+
 int log_files_to_upload = 0;
 
 static int update_log_count() {
@@ -61,6 +68,13 @@ static log_uploader_event_t upload_file(char* filename) {
     fclose(f);
     remove(filename);
     return FILE_HANDLED;
+  }
+  if (file_size >= LEGACY_LOG_SIZE_THRESHOLD) {
+    ESP_LOGW(LOG_UPLOADER_TASK,
+             "%s is %d bytes — pre-aggregation legacy file, deleting (not uploaded)",
+             filename, file_size);
+    fclose(f);
+    return FILE_HANDLED;  // caller removes it and decrements the count
   }
   fseek(f, 0, SEEK_SET);
   char* buffer = pvPortMalloc(file_size);

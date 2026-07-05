@@ -1,22 +1,17 @@
 syntax = "proto3";
 
 message NoiseRecording {
-  message Record {
-    uint32 seq_no    = 1;   // monotonic; gap detection
-    bytes  bands     = 2;   // 31 bytes; (dB - 20) * 2 per band
-    uint32 laeq_1s   = 3;   // same encoding as bands
-    uint32 lceq_1s   = 4;
-    uint32 lafmax_1s = 5;
-    uint32 lcfmax_1s = 6;
-    uint32 lcpeak_1s = 7;
-  }
-  reserved 3, 4;                      // previously laeq_15m / lceq_15m
-
-  repeated Record records       = 2;  // 1 (MQTT/BLE live) or up to 300 (file)
-  optional uint32 battery_mv    = 5;  // millivolts; only set on live messages when on battery
-  optional uint32 laeq_5m       = 6;  // last 5 min, same encoding as Record.laeq_1s
-                                      // ((dB - 20) * 2); only set once the ring is full
-  optional uint32 lceq_5m       = 7;  // last 5 min, same gate as laeq_5m
-  optional uint32 laeq_30m      = 8;  // last 30 min; only set once the ring is full
-  optional uint32 lceq_30m      = 9;  // last 30 min, same gate as laeq_30m
+  uint32 seq_no  = 1;   // per-second (live) or per-minute (disk) counter; gap detection
+  bytes  bands   = 2;   // 31 bytes; (dB - 20) * 2 per band, averaged over the interval
+  uint32 laeq    = 3;   // (dB - 20) * 2 — LAeq over the record's interval
+  uint32 lceq    = 4;   // LCeq over the interval
+  uint32 lafmax  = 5;   // max over the interval
+  uint32 lcfmax  = 6;
+  uint32 lcpeak  = 7;
+  uint32 record_interval_seconds = 8;  // 1 = live 1 Hz, 60 = on-disk minute aggregate
+  optional uint32 battery_mv = 9;      // millivolts; only set on live messages when on battery
+  optional uint32 laeq_5m  = 10;       // last 5 min, same encoding; only once the ring is full
+  optional uint32 lceq_5m  = 11;
+  optional uint32 laeq_30m = 12;       // last 30 min
+  optional uint32 lceq_30m = 13;
 }
