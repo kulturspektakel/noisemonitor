@@ -23,24 +23,24 @@ memory-driven and should stay.
 > of up to 300 per-second records. `NoiseRecording_size` fell from 16816 to
 > **73 bytes**, which freed **~15.6 KB of internal BSS** and made items **1**
 > and **9** below doable *without* PSRAM — both are now done (see their tags).
-> That freed BSS is also enough headroom to bump `RING_30M` back to 1800
-> (restore the 30-min average) pre-PSRAM — but only if it isn't spent on a
-> BLE-coexistence attempt instead.
+> That freed BSS was spent on restoring the **30-min average**: `RING_30M` is
+> back to 1800 (the no-PSRAM BLE-coexistence path was ruled out — uploads fail
+> under BLE, see item 7 — so the headroom went here instead).
 
-## TL;DR — the one-line revert to get the 30-min average back
+## 30-min average — RESTORED (2026-07)
 
 `main/audio_dsp.c`:
 
 ```c
-#define RING_30M 300    // <-- bump to 1800 when PSRAM is available
+#define RING_30M 1800   // full 30-min ring (was 300 = 5-min under heap pressure)
 ```
 
-The 30-min window is currently shrunk to a 5-min ring (300 entries) to fit
-the no-PSRAM heap budget. `WINDOW_30M_SEC` is intentionally decoupled from
-`RING_30M` and pinned at 1800, so `has_30m` stays false and the
-`laeq_30m` / `lceq_30m` proto fields stay unset (the website renders them
-as gaps — graceful degrade). Restoring the 1800-entry ring re-enables the
-30-min average with no other code change.
+The 30-min sliding window (`laeq_30m` / `lceq_30m`) is **re-enabled**: the
+proto flatten freed ~15.6 KB BSS, so the full 1800-entry ring (14.4 KB) fits
+again while BLE is off. `has_30m` goes true after 30 min of uptime. Previously
+the ring was shrunk to 300 (5-min only) and `has_30m` stayed false, leaving the
+fields unset (website rendered them as gaps). On the PSRAM board the ring moves
+to PSRAM via `EXT_RAM_BSS_ATTR` regardless.
 
 ## Section 1 — Revert with PSRAM
 

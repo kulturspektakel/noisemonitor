@@ -62,14 +62,13 @@ static const char* TAG = "audio_dsp";
 
 // --- Aggregate ring size — 30 min holds enough seconds for 5-min and 30-min
 //     sliding-window Leq computations from the same buffer.
-// Ring size for the sliding-window aggregates. Sized for 5-min on the
-// no-PSRAM board (300 entries × 2 channels × 4 B = 2.4 KB BSS). The 30-min
-// window stays defined at 1800 seconds below, so has_30m never goes true
-// while RING_30M < 1800 — the laeq_30m / lceq_30m proto fields stay unset
-// and the website renders them as gaps. When the PSRAM board arrives,
-// change this back to 1800 to re-enable the 30-min average. One-line
-// revert — see PSRAM_MIGRATION.md.
-#define RING_30M 300
+// 1800 entries × 2 channels × 4 B = 14.4 KB BSS. This was shrunk to 300 (5-min
+// only, has_30m gated off) under no-PSRAM heap pressure, but flattening the
+// NoiseRecording proto (2026-07) freed ~15.6 KB of BSS — enough to restore the
+// full 30-min ring here while BLE stays off. has_30m now goes true after 30 min
+// of uptime and laeq_30m / lceq_30m are emitted again. On the PSRAM board this
+// moves to PSRAM via EXT_RAM_BSS_ATTR (see PSRAM_MIGRATION.md).
+#define RING_30M 1800
 
 // --- Center frequencies (Hz) per band, spec §5 --------------------------------
 static const float band_centers[NOISE_BANDS] = {
