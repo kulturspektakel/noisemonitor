@@ -90,7 +90,8 @@ static void IRAM_ATTR gpio_interrupt_handler(void* args) {
 static void voltage_update_timer_callback(TimerHandle_t xTimer) {
   // Re-arm: this is a one-shot timer; reset it for next interval.
   xTimerReset(xTimer, 0);
-  gpio_interrupt_handler(NULL);
+  // runs in the timer-service task, not an ISR, so use the non-ISR notify
+  xTaskNotifyGive(xTaskGetHandle(POWER_MANAGEMENT_TASK));
 }
 
 static void ledc_init() {
