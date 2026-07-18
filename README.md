@@ -25,7 +25,7 @@ INMP441 (I²S mic) ──► I²S RX peripheral ──► audio_dsp task
                                                                   └─► record_writer (LittleFS)
 ```
 
-Records go out every second containing 31 band values + 5 weighted summary metrics. The 5-minute sliding LAeq/LCeq aggregates are computed from in-RAM ring buffers and attached to every `NoiseRecording` message. (The protobuf also reserves optional `laeq_30m` / `lceq_30m` fields; they go live once the device runs on PSRAM — see [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md).)
+Records go out every second containing 31 band values + 5 weighted summary metrics. The 5-minute and 30-minute sliding LAeq/LCeq aggregates are computed from in-RAM ring buffers (in PSRAM) and attached to every `NoiseRecording` message. `laeq_30m` / `lceq_30m` populate after 30 min of uptime.
 
 ---
 
@@ -33,7 +33,7 @@ Records go out every second containing 31 band values + 5 weighted summary metri
 
 | Component | Part / wiring |
 |---|---|
-| MCU | ESP32-S3-WROOM-1-N16 (16 MB flash, no PSRAM) |
+| MCU | ESP32-S3-N16R2 (16 MB flash, 2 MB QSPI PSRAM) |
 | Microphone | **InvenSense INMP441** (I²S, 3.3V-tolerant) |
 | Pins | BCLK = GPIO 11, WS = GPIO 9, SD = GPIO 12; L/R tied to GND |
 
@@ -45,20 +45,22 @@ Records go out every second containing 31 band values + 5 weighted summary metri
 
 A textbook Type-1 SLM uses cascaded biquad filters for A-weighting + 1/3-octave bandpass per band — accurate, but ~62 IIR filters running per sample at 48 kHz is heavy. We use a single 4096-pt FFT every 42 ms (50% overlap → ~23 FFTs/sec) and derive both A-weighting and bands from that. Far less CPU, accurate enough for festival monitoring.
 
-### Why 4096-pt radix-2 (not radix-4)
+### Why 4096-pt radix-2 SIMD (not radix-4)
 
-The spec preferred radix-4 (faster). But on this no-PSRAM ESP32-S3, the radix-4 twiddle table (~64 KB) wouldn't allocate contiguously after WiFi + BLE fragmented the heap. Radix-2 needs only 16 KB and fits anywhere. CPU is not the constraint — we have plenty of headroom at 160 MHz.
+The spec preferred radix-4 (faster). We use radix-2 with the **hardware SIMD** kernel (`dsps_fft2r_fc32_aes3`), which is faster than *ANSI* radix-4 while keeping the small 16 KB twiddle table (radix-4 needs ~64 KB). CPU isn't the constraint at 160 MHz, so radix-4 isn't worth the larger table.
 
-### Why the ANSI FFT, not SIMD
+### The SIMD FFT: an alignment requirement, not a bug
 
-`esp-dsp`'s SIMD-accelerated `dsps_fft2r_fc32` on ESP32-S3 has a bug: with all-zero input, it outputs a constant `1.6` in every imaginary bin. This leaks ~45 dB of fictional broadband noise floor into the spectrum, pinning every band at a constant value regardless of actual signal. We explicitly call the `_ansi` variants:
+We previously believed `esp-dsp`'s SIMD `dsps_fft2r_fc32_aes3` on ESP32-S3 was broken — it emitted a constant `~1.6` in every imaginary bin from zero input. That was actually **our** bug: the aes3 kernel uses `ee.ldf.64` / `ee.stf.64` paired loads that require ≥8-byte-aligned data, and `fft_work` was a plain 4-byte-aligned array, so the loads straddled into adjacent BSS. With `fft_work` declared `__attribute__((aligned(16)))` the SIMD output matches ANSI exactly (verified on-device). We call:
 
 ```c
-dsps_fft2r_fc32_ansi(fft_work, FFT_SIZE);
-dsps_bit_rev_fc32_ansi(fft_work, FFT_SIZE);
+dsps_fft2r_fc32_aes3(fft_work, FFT_SIZE);   // fft_work must be ≥8-byte aligned
+dsps_bit_rev_fc32_ansi(fft_work, FFT_SIZE); // no SIMD bit-reverse is wired up here
 ```
 
-The ANSI version is correct and the perf difference at 23 FFTs/s is negligible.
+### Float, not double, in the DSP hot loops
+
+The ESP32-S3 FPU is single-precision only — `double` math is software-emulated. The per-FFT band + A/C-weighting accumulation (~2048 bins, twice per FFT) was originally written with `double` and cost **12.8 ms/FFT**, ~3.7× the SIMD FFT itself. Converting those inner loops to `float` dropped it to **0.3 ms** (41× faster), taking the whole DSP from ~38% to ~9% of one core. float32 round-off over a few thousand bins is ~1e-4 relative — far below the 0.5 dB output quantization — and on-device LAeq was unchanged. Keep DSP hot-path math in `float`; reserve `double` for cold once-per-second aggregation.
 
 ### Why per-bin A-weighting (not per-band)
 
@@ -141,7 +143,7 @@ The 31 bands are **unweighted**, so downstream consumers (dashboards, server) ca
 
 `NoiseRecording.laeq_5m / lceq_5m / laeq_30m / lceq_30m` are sliding Leqs over the last 5 and 30 minutes. They share a single ring buffer per channel (`laeq_ring[RING_30M]` and `lceq_ring[RING_30M]`); a single-pass walk via `audio_dsp_get_aggregates` accumulates both window sums at once.
 
-**Current state (no-PSRAM board): `RING_30M = 300`**, so only the 5-min window is populated. `WINDOW_30M_SEC` is intentionally pinned at 1800 so `has_30m` stays false and the 30-min fields stay unset — the website renders them as gaps. Bumping `RING_30M` to 1800 (one-line change in `audio_dsp.c`) re-enables the 30-min average; defer until the ESP32-S3-N16R2 board lands so we have the BSS headroom. See [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md).
+`RING_30M = 1800` (full 30-min window). The rings live in PSRAM (`EXT_RAM_BSS_ATTR`), so both the 5-min and 30-min windows populate; `has_30m` goes true after 30 min of uptime.
 
 All four fields are `optional` and are **only set when the ring holds the full window of data** — 5-min fields appear after the device has been running 5+ minutes; below that threshold the average would be over fewer samples than the field name implies, so the device omits them entirely (consumers see "missing" rather than misleading).
 
@@ -232,32 +234,33 @@ idf.py -p /dev/cu.usbmodem* flash monitor
 
 ## Memory tuning
 
-The ESP32-S3 has 320 KB SRAM, no PSRAM, and we run audio DSP + WiFi + BLE + MQTT + LittleFS concurrently. The heap gets aggressively fragmented during driver init — by the time tasks are running, the **largest contiguous free chunk hovers around 8 KB** even when 20+ KB total is free. So we don't fight fragmentation directly; we keep large buffers either in BSS (static, link-time reserved, never on heap) or pre-allocated very early.
+The board is an ESP32-S3-N16R2: 320 KB internal SRAM **plus 2 MB QSPI PSRAM**. We run audio DSP + WiFi + BLE + MQTT-TLS + HTTPS upload + LittleFS concurrently. PSRAM removes the old internal-heap crunch: the pre-PSRAM firmware had to disable BLE (`DEV_NO_BLE`) because NimBLE + the BT controller + WiFi/mbedtls + a second concurrent TLS session (backlog log upload) couldn't all fit in internal DRAM. With PSRAM that constraint is gone.
 
-| Large buffer | Strategy | Reason |
+**What moves to PSRAM:**
+
+- **WiFi / LWIP buffers** — `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` spills these out of internal DRAM automatically, which is what frees the headroom for BLE + dual-TLS.
+- **30-min Leq ring buffers** (`laeq_ring` / `lceq_ring`, 14.4 KB combined) — tagged `EXT_RAM_BSS_ATTR`. They're written and read once per second, so PSRAM's higher access latency is irrelevant.
+
+**What stays in internal DRAM** (touched on every FFT, ~23×/sec, or trivially small — PSRAM latency would hurt or gain nothing):
+
+| Buffer | Where | Note |
 |---|---|---|
-| FFT twiddle table (16 KB) | Heap-allocated in `audio_dsp_preinit()` from `app_main` | Needs to be in DRAM accessible by esp-dsp SIMD/ANSI code; aligned heap alloc is required |
-| LogMessage staging (12.5 KB at 300 records) | **Static (BSS)** in `record_writer.c` | Avoids heap pool entirely; no risk of failed lazy alloc later. Initialized once at boot; fields overwritten per batch |
-| A/C per-bin weight tables (8 KB each) | Static (BSS) in `audio_dsp.c` | One-time compute at init, never reallocated |
-| FFT work buffer (32 KB), Hann | Static (BSS) in `audio_dsp.c` | Hot-path buffers, no allocation churn |
+| FFT twiddle table `fft_table` (16 KB) | static BSS, `audio_dsp.c` | 16-byte aligned; internal BSS array (was heap-allocated in the now-removed `audio_dsp_preinit()`) |
+| FFT work buffer `fft_work` (32 KB), Hann window | static BSS, `audio_dsp.c` | Hot path |
+| A/C per-bin weight tables (8 KB each) | static BSS, `audio_dsp.c` | Read every FFT |
+| LogMessage staging | static BSS, `record_writer.c` | ~60 B since the proto was flattened — no reason to move |
+| Task stacks, BLE controller, I²S DMA descriptors | internal | Latency- / DMA-sensitive |
 
-Three further tunings are needed to coexist with WiFi + BLE in the remaining heap:
+**Coexistence settings that matter for WiFi + BLE + two TLS sessions.** Getting BLE back on alongside MQTT-TLS *and* a concurrent HTTPS log upload took more than flipping `CONFIG_SPIRAM=y`, because several things can't or don't move to PSRAM by default:
 
-- **BLE-first startup order.** `wifi_connect` waits on the `BLE_HOST_READY` event-group bit before initializing. If WiFi runs first it consumes ~110 KB and the BLE controller's runtime DMA-internal allocations later fail (`set_advertising_data` returns `BLE_ERR_MEM_CAPACITY` and the device becomes silently undiscoverable).
-- **NimBLE pool trims** in `sdkconfig.defaults`: `MSYS_1/MSYS_2_BLOCK_COUNT`, `TRANSPORT_ACL_FROM_LL_COUNT`, `TRANSPORT_EVT_COUNT`, `TRANSPORT_EVT_DISCARD_COUNT` all cut well below defaults.
-- **MQTT client config** is tightened from defaults:
-  - `cfg.buffer.size = 256` (default 1024) — our messages are 50-100 bytes encoded
-  - `cfg.buffer.out_size = 256` (default 1024)
-  - `cfg.task.stack_size = 3072` (default 6144) — the MQTT task loop is tight at our message sizes
-- **mbedtls SSL buffers** shrunk to 4096 (default 16384) and **LWIP TCP windows** shrunk to 2880 (default 5760).
+- **WiFi *static* RX buffers stay in internal DMA RAM** even with PSRAM. At 24 buffers (~38 KB) they starved the BLE controller's HCI init (`hci inits failed`). Kept at the IDF default of 10; the *dynamic* RX/TX pools stay large and live in PSRAM instead (they carry the HTTPS upload throughput).
+- **mbedtls uses `CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC`** (not the pre-PSRAM `INTERNAL`). With `SPIRAM_MALLOC_ALWAYSINTERNAL=16384`, TLS buffers ≥16 KB land in PSRAM — which is what lets the second (upload) TLS handshake's ~17 KB buffer allocate while MQTT's session is live. `CONFIG_MBEDTLS_DYNAMIC_BUFFER=y` still sizes/frees them on demand.
+- **Software SHA/AES** (`CONFIG_MBEDTLS_HARDWARE_AES/SHA=n`, matching the already-software `MPI`). The HW crypto DMA path can't read PSRAM-resident TLS buffers directly and allocates an internal DMA bounce buffer per record; with two sessions those internal allocs fail. Software crypto works straight from PSRAM; CPU cost is negligible at our TLS volume.
+- **`CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536`** (default 32 KB) — reserves internal RAM for the allocations that *must* be internal (FreeRTOS objects, LWIP netconn semaphores, DMA). Without the extra headroom a backlog-drain burst briefly exhausted it (`thread_sem_init: out of memory`).
 
-The I²S driver is also tuned for smaller DMA descriptors (`dma_desc_num=4, dma_frame_num=120`) — ~2.5 ms DMA window, well under our 21 ms read cadence, saves a few KB.
+Also kept regardless of PSRAM: the I²S small-DMA-descriptor config.
 
-The 5-min sliding-window ring buffers (`RING_30M = 300` per channel, 2.4 KB BSS) replaced an earlier 30-min ring (1800, 14.4 KB BSS) for the same heap reason. The 30-min protobuf fields are reserved but unset.
-
-**If you add anything that takes a contiguous heap chunk > ~8 KB at runtime, it will fail.** Either preinit-allocate it (like the FFT table), put it in BSS (like LogMessage), or rework it to stream.
-
-Most of these compromises go away once the **ESP32-S3-N16R2 (2 MB PSRAM)** board arrives. See [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md) for the per-item revert plan.
+See [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md) for the full migration history and the one deferred item (radix-4 FFT).
 
 ---
 

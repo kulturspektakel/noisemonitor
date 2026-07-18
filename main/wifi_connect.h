@@ -9,8 +9,8 @@ void wifi_connect(void* params);
 
 // Kick an immediate WiFi connect attempt if we're not already connected or
 // mid-connect. Safe to call from any (non-ISR) task; a no-op if the WiFi task
-// isn't running (e.g. DEV_NO_NET builds). Used to opportunistically connect
-// when a BLE client attaches, instead of waiting for the retry timer.
+// isn't running. Used to opportunistically connect when a BLE client attaches,
+// instead of waiting for the retry timer.
 void wifi_connect_trigger(void);
 
 // Persist new WiFi credentials to NVS and trigger reconnect with them.

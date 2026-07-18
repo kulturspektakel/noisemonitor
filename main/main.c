@@ -1,22 +1,5 @@
 #include <stdio.h>
 
-// Dev-time hacks for the no-PSRAM board, where NimBLE + the BT controller
-// and the WiFi/mbedtls stack can't both fit in contiguous heap (see
-// LOG_UPLOAD_PRE_PSRAM.md and PSRAM_MIGRATION.md). Pick at most ONE:
-//
-//   DEV_NO_BLE — boot WiFi/MQTT/upload only; BLE off. Calibration + WiFi
-//                creds entry over BLE are unavailable, so creds must already
-//                be in NVS. This is the normal field config pre-PSRAM.
-//   DEV_NO_NET — boot BLE only; WiFi/MQTT/upload off. For BLE-only bench
-//                tests. The net consumer tasks self-gate on WIFI_CONNECTED,
-//                so skipping wifi_connect is enough to keep the stack (and
-//                its heap) from ever coming up.
-//
-// Both become irrelevant once the PSRAM board lands; remove together with
-// the other no-PSRAM workarounds then.
-#define DEV_NO_BLE
-// #define DEV_NO_NET
-
 #include "audio_dsp.h"
 #include "ble_publisher.h"
 #include "calibration.h"
@@ -43,16 +26,6 @@
 EventGroupHandle_t event_group;
 SemaphoreHandle_t network_request;
 
-#if defined(DEV_NO_BLE) || defined(DEV_NO_NET)
-// Stand-in for a disabled consumer task: keep its record queue drained so the
-// DSP's non-blocking sends don't accumulate "queue full" warnings. The queue
-// handle is passed as the task argument.
-static void queue_drain(void* queue) {
-  record_t r;
-  while (true) xQueueReceive((QueueHandle_t)queue, &r, portMAX_DELAY);
-}
-#endif
-
 void app_main(void) {
   // Dynamic frequency scaling between 40 MHz idle and 160 MHz active.
   // Light sleep is disabled: the I²S driver holds an APB-freq lock while
@@ -67,25 +40,11 @@ void app_main(void) {
   };
   ESP_ERROR_CHECK(esp_pm_configure(&pm_cfg));
 
-  heap_diag("before preinit");
-
-  // Reserve the FFT twiddle table early (16 KB). LogMessage is in BSS
-  // (record_writer.c) so it doesn't go through heap.
-  ESP_ERROR_CHECK(audio_dsp_preinit());
-
-  heap_diag("after fft_table alloc");
+  heap_diag("at boot");
 
   event_group = xEventGroupCreate();
   network_request = xSemaphoreCreateBinary();
   xSemaphoreGive(network_request);
-
-#ifdef DEV_NO_NET
-  // No WiFi -> no SNTP, so TIME_SET would never fire and the DSP gates off all
-  // record emission (audio_dsp.c). Force it so per-second records flow to the
-  // BLE queue. Timestamps are bogus (clock starts at boot epoch) — acceptable
-  // for a bench test; never ship with DEV_NO_NET defined.
-  xEventGroupSetBits(event_group, TIME_SET);
-#endif
 
   ESP_ERROR_CHECK(nvs_flash_init());
   esp_vfs_littlefs_conf_t conf = {
@@ -114,11 +73,9 @@ void app_main(void) {
   ble_publisher_queue  = xQueueCreate(16, sizeof(record_t));
 
   // Reused infrastructure (Core 0)
-#ifndef DEV_NO_NET
   xTaskCreate(&wifi_connect,     WIFI_CONNECT_TASK,     4096, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&time_sync,        "time_sync",           4096, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&log_uploader,     LOG_UPLOADER_TASK,     4096, NULL, TASK_PRIO_NORMAL, NULL);
-#endif
   xTaskCreate(&power_management, POWER_MANAGEMENT_TASK, 4096, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&load_device_id,   "load_device_id",      3072, NULL, TASK_PRIO_NORMAL, NULL);
   xTaskCreate(&load_salt,        "load_salt",           3072, NULL, TASK_PRIO_NORMAL, NULL);
@@ -128,16 +85,8 @@ void app_main(void) {
   xTaskCreate(&record_writer,    "record_writer",       6144, NULL, TASK_PRIO_NORMAL, NULL);
 
   // New
-#ifdef DEV_NO_NET
-  xTaskCreate(&queue_drain,      "mqtt_drain",          2048, mqtt_publisher_queue, TASK_PRIO_NORMAL, NULL);
-#else
   xTaskCreate(&mqtt_publisher,   "mqtt_publisher",      4096, NULL, TASK_PRIO_NORMAL, NULL);
-#endif
-#ifdef DEV_NO_BLE
-  xTaskCreate(&queue_drain,      "ble_drain",           2048, ble_publisher_queue, TASK_PRIO_NORMAL, NULL);
-#else
   xTaskCreate(&ble_publisher,    "ble_publisher",       4096, NULL, TASK_PRIO_NORMAL, NULL);
-#endif
   xTaskCreate(&status_led,       "status_led",          2048, NULL, TASK_PRIO_NORMAL, NULL);
 
   // Real-time DSP pinned to Core 1, isolated from networking (§6).

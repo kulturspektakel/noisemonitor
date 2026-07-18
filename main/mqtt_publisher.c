@@ -10,12 +10,13 @@
 
 static const char* TAG = "mqtt_publisher";
 
-// Dev broker per spec §9. Plain MQTT (no TLS) for development against the
-// public sandbox broker: mbedtls SSL session buffers don't fit in the
-// fragmented heap we have left after BLE+audio_dsp init (allocation fails
-// with MBEDTLS_ERR_SSL_ALLOC_FAILED). For production against a real broker
-// switch to mqtts:// once the in/out content lengths have been tuned and
-// the actual heap budget verified.
+// Dev broker per spec §9: plaintext MQTT to a public sandbox broker. NOTE this
+// is unauthenticated and unencrypted — anyone can read/inject on this topic.
+// The old blocker for mqtts:// (TLS buffers wouldn't fit in the fragmented
+// internal heap) is gone post-PSRAM: the log uploader already runs a TLS
+// session fine, and TLS buffers now allocate from PSRAM. Switching to
+// production is just pointing MQTT_URI at the real broker (mqtts://) and adding
+// credentials — see the coexistence notes in PSRAM_MIGRATION.md.
 #define MQTT_URI "mqtt://broker.emqx.io:1883"
 
 static esp_mqtt_client_handle_t mqtt_client = NULL;

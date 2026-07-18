@@ -12,6 +12,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "heap_diag.h"
@@ -35,12 +36,14 @@ static const char* TAG = "audio_dsp";
 #define I2S_BUFFER_FRAMES 1024         // per i2s_channel_read call
 
 // --- FFT configuration --------------------------------------------------------
-// Spec §13 prefers radix-4 FFT, but on this no-PSRAM ESP32-S3 the radix-4
-// twiddle table (64 KB at 4096-pt) couldn't be allocated contiguously after
-// WiFi+BLE fragmented the heap. Radix-2 uses only FFT_SIZE floats = 16 KB
-// for its twiddle table — fits anywhere. esp-dsp's dsps_fft2r_fc32_aes3
-// (SIMD) closes most of the radix-2-vs-radix-4 speed gap on S3. Our DSP
-// budget at 160 MHz has plenty of headroom either way.
+// Radix-2, hardware SIMD (aes3) — see the dsps_fft2r_fc32_aes3 call site for why
+// the SIMD path is correct once fft_work is aligned. The radix-2 twiddle table is
+// only FFT_SIZE floats (16 KB) and lives in internal BSS (fft_table).
+// Radix-4 SIMD was benchmarked (2026-07): ~16 % faster per FFT (2875 vs 3427 µs)
+// but its twiddle table is 4×FFT_SIZE = 64 KB, and putting that in internal RAM
+// starved the BLE controller (esp_bt_controller_init -4 NO_MEM). The FFT is only
+// ~8 % of one core at 160 MHz either way, so the 64 KB (or a PSRAM twiddle that
+// would erase the speedup) isn't worth it — radix-2 SIMD stays.
 #define FFT_SIZE 4096
 #define FFT_HOP  2048     // 50% overlap
 
@@ -62,12 +65,11 @@ static const char* TAG = "audio_dsp";
 
 // --- Aggregate ring size — 30 min holds enough seconds for 5-min and 30-min
 //     sliding-window Leq computations from the same buffer.
-// 1800 entries × 2 channels × 4 B = 14.4 KB BSS. This was shrunk to 300 (5-min
-// only, has_30m gated off) under no-PSRAM heap pressure, but flattening the
-// NoiseRecording proto (2026-07) freed ~15.6 KB of BSS — enough to restore the
-// full 30-min ring here while BLE stays off. has_30m now goes true after 30 min
-// of uptime and laeq_30m / lceq_30m are emitted again. On the PSRAM board this
-// moves to PSRAM via EXT_RAM_BSS_ATTR (see PSRAM_MIGRATION.md).
+// 1800 entries × 2 channels × 4 B = 14.4 KB. The rings (laeq_ring/lceq_ring)
+// live in PSRAM via EXT_RAM_BSS_ATTR — they're written and read once per second,
+// so PSRAM latency is irrelevant, and keeping them out of internal DRAM leaves
+// room for the BLE controller and a second TLS session. has_30m goes true after
+// 30 min of uptime; laeq_30m / lceq_30m are emitted then.
 #define RING_30M 1800
 
 // --- Center frequencies (Hz) per band, spec §5 --------------------------------
@@ -105,10 +107,15 @@ static float    fft_ring[FFT_SIZE];                // last FFT_SIZE float sample
 static int      fft_ring_head = 0;                 // next write index
 static int      samples_since_last_fft = 0;        // hop counter
 
-static float    fft_work[FFT_SIZE * 2];            // complex pairs for FFT in/out
+// 16-byte aligned: the aes3 SIMD FFT uses ee.ldf.64/ee.stf.64 paired loads that
+// require ≥8-byte-aligned data. A plain (4-byte) array made those loads straddle
+// into adjacent BSS — the source of the "im=1.6 from zero input" artifact.
+static float    fft_work[FFT_SIZE * 2] __attribute__((aligned(16)));  // complex pairs for FFT in/out
 // Twiddle-factor table for dsps_fft2r_init_fc32 (16 KB at FFT_SIZE=4096).
-// Heap-allocated in audio_dsp_preinit() (called from app_main).
-static float*   fft_table = NULL;
+// Internal BSS (link-time reserved), 16-byte aligned for esp-dsp's SIMD loads.
+// Read on every FFT, so it stays in internal RAM (not PSRAM); being a static
+// array (not an early heap grab) is what let audio_dsp_preinit() go away.
+static float    fft_table[FFT_SIZE] __attribute__((aligned(16)));
 static int      band_start_bin[NOISE_BANDS + 1];   // inclusive start; one extra = exclusive end of last band
 static float    band_cal_lin[NOISE_BANDS];          // 10^(band_cal_offset_db / 10)
 
@@ -117,8 +124,10 @@ static float    fft_energy_to_spl_db;   // ≈ +58.0 — added to every energy->
 static float    peak_to_spl_db;         // ≈ +123.0 — LCpeak amplitude->dB
 
 // Per-bin A and C weighting (linear power factors), populated at init from
-// IEC 61672 formulas. 8 KB each, BSS. Avoid the band-center approximation
-// for LAeq/LCeq — apply weighting at each bin's exact frequency instead.
+// IEC 61672 formulas. 8 KB each, internal BSS. Read on every FFT in the band
+// accumulation loop, so they stay in internal RAM with the rest of the FFT hot
+// path. Avoid the band-center approximation for LAeq/LCeq — apply weighting at
+// each bin's exact frequency instead.
 static float    a_weight_bin[FFT_SIZE / 2];
 static float    c_weight_bin[FFT_SIZE / 2];
 
@@ -155,8 +164,9 @@ static QueueHandle_t dsp_work_queue;
 
 // 30-min sliding LAeq/LCeq ring buffers (linear energies, not dB).
 // Same buffers serve the 5-minute window via compute_leq_recent(..., 300).
-static float    laeq_ring[RING_30M];
-static float    lceq_ring[RING_30M];
+// In PSRAM (EXT_RAM_BSS_ATTR): large, cold (one write + one read per second).
+EXT_RAM_BSS_ATTR static float laeq_ring[RING_30M];
+EXT_RAM_BSS_ATTR static float lceq_ring[RING_30M];
 static int      ring_idx = 0;
 static int      total_seconds = 0;
 
@@ -353,27 +363,7 @@ static float band_cal_mean_db(void) {
   return sum / (float)NOISE_BANDS;
 }
 
-esp_err_t audio_dsp_preinit(void) {
-  // Radix-2 twiddle table = FFT_SIZE floats (16 KB at 4096-pt). Aligned to
-  // 16 bytes for esp-dsp's SIMD load instructions.
-  fft_table = heap_caps_aligned_alloc(16, FFT_SIZE * sizeof(float),
-                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  if (fft_table == NULL) {
-    ESP_LOGE(TAG, "preinit: failed to allocate %d-byte FFT table",
-             (int)(FFT_SIZE * sizeof(float)));
-    return ESP_ERR_NO_MEM;
-  }
-  ESP_LOGI(TAG, "preinit: FFT table allocated (%d bytes)",
-           (int)(FFT_SIZE * sizeof(float)));
-  return ESP_OK;
-}
-
 static void dsp_init(void) {
-  if (fft_table == NULL) {
-    ESP_LOGE(TAG, "fft_table not allocated — did app_main forget audio_dsp_preinit()?");
-    vTaskDelete(NULL);
-    return;
-  }
   esp_err_t err = dsps_fft2r_init_fc32(fft_table, FFT_SIZE);
   if (err != ESP_OK && err != ESP_ERR_DSP_REINITIALIZED) {
     ESP_LOGE(TAG, "dsps_fft2r_init_fc32 failed: 0x%x", err);
@@ -419,12 +409,15 @@ static void run_fft_and_accumulate(int head_snapshot) {
     fft_work[2 * i + 1] = 0.0f;
   }
 
-  // ANSI variant: SIMD-accelerated dsps_fft2r_fc32 on ESP32-S3 returns a
-  // constant 1.6 in every imaginary bin from zero input (verified empirically
-  // 2026-05-15). Bug is in dsps_fft2r_fc32_aes3_.S (community-contributed
-  // assembly, esp-dsp 1.8.2). ae32 SIMD doesn't run on S3 either (crashes).
-  // ANSI is correct; ~14% of 1 core for 23 FFTs/s — well within budget.
-  dsps_fft2r_fc32_ansi(fft_work, FFT_SIZE);
+  // aes3 SIMD FFT. The old "im=1.6 from zero input" artifact that once forced us
+  // onto the ANSI variant was NOT an assembly defect — it was an alignment bug on
+  // our side: the aes3 kernel uses ee.ldf.64/ee.stf.64 paired loads that need
+  // 8-byte-aligned data, and fft_work was a plain 4-byte-aligned array, so the
+  // loads straddled into adjacent BSS. With fft_work now __attribute__((aligned
+  // (16))) the SIMD output matches ANSI exactly (verified on-device 2026-07,
+  // quiet-room LAeq identical). bit_rev stays ANSI (dsps_bit_rev_fc32 resolves to
+  // _ansi even under DSP_OPTIMIZED — there is no wired-up SIMD bit-reverse here).
+  dsps_fft2r_fc32_aes3(fft_work, FFT_SIZE);
   dsps_bit_rev_fc32_ansi(fft_work, FFT_SIZE);
 
   // Hann window's global power gain (0.375) is absorbed into the calibration
@@ -438,13 +431,16 @@ static void run_fft_and_accumulate(int head_snapshot) {
     int end = band_start_bin[b + 1];
     if (end <= start) end = start + 1;
     if (end > FFT_SIZE / 2) end = FFT_SIZE / 2;
-    double sum = 0.0;
+    // float inner loop: the S3 FPU is single-precision, so double math here is
+    // software-emulated (~4× the whole FFT's cost when this was double). float32
+    // round-off over a band's bins is ~1e-4 relative ≪ our 0.5 dB output step.
+    float sum = 0.0f;
     for (int k = start; k < end; k++) {
       float re = fft_work[2 * k];
       float im = fft_work[2 * k + 1];
-      sum += (double)re * re + (double)im * im;
+      sum += re * re + im * im;
     }
-    band_energy_sum[b] += sum * (double)band_cal_lin[b];
+    band_energy_sum[b] += (double)sum * (double)band_cal_lin[b];
   }
 
   // Per-bin A/C weighted accumulation for LAeq/LCeq. Applying the weight at
@@ -452,13 +448,13 @@ static void run_fft_and_accumulate(int head_snapshot) {
   // frequency-quantization error that overestimates tones between band
   // centers — especially at low frequencies where bands are only a few bins
   // wide.
-  double a_sum = 0.0, c_sum = 0.0;
+  float a_sum = 0.0f, c_sum = 0.0f;
   for (int k = 1; k < FFT_SIZE / 2; k++) {
     float re = fft_work[2 * k];
     float im = fft_work[2 * k + 1];
-    double bin_energy = (double)re * re + (double)im * im;
-    a_sum += bin_energy * (double)a_weight_bin[k];
-    c_sum += bin_energy * (double)c_weight_bin[k];
+    float bin_energy = re * re + im * im;
+    a_sum += bin_energy * a_weight_bin[k];
+    c_sum += bin_energy * c_weight_bin[k];
   }
   a_weighted_sum_per_sec += a_sum;
   c_weighted_sum_per_sec += c_sum;

@@ -1,7 +1,27 @@
-# Festival Noise Monitor — ESP32-S3, 16 MB flash, custom partition table.
+# Festival Noise Monitor — ESP32-S3-N16R2, 16 MB flash + 2 MB QSPI PSRAM,
+# custom partition table.
 #
 CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# PSRAM (ESP32-S3-N16R2: 2 MB quad SPI PSRAM). SPIRAM_USE_MALLOC lets the heap
+# allocator hand out PSRAM; SPIRAM_TRY_ALLOCATE_WIFI_LWIP spills WiFi/LWIP
+# buffers there to free internal DRAM for the BLE controller and a second
+# concurrent TLS session (HTTPS log upload alongside MQTT-TLS).
+# SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY is required for EXT_RAM_BSS_ATTR to
+# actually place static BSS (the 30-min Leq rings) in PSRAM.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_TYPE_AUTO=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+# Reserve more internal RAM (default 32 KB) for internal-only allocations —
+# FreeRTOS objects, LWIP netconn semaphores, DMA. During a backlog-drain burst
+# (many rapid HTTPS uploads while MQTT is live) LWIP briefly failed to create
+# netconn semaphores ("thread_sem_init: out of memory"); 64 KB clears it.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_ESP_TLS_INSECURE=y
 CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
@@ -61,12 +81,17 @@ CONFIG_ESP_PHY_CALIBRATION_AND_DATA_STORAGE=n
 CONFIG_SPI_FLASH_AUTO_SUSPEND=y
 CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
 
-# WiFi/LWIP buffers above IDF defaults to handle sustained HTTPS upload
-# load without `wifi:m f null` starvation. Affordable while BLE is off
-# (DEV_NO_BLE in main.c) and stays affordable post-PSRAM via
-# SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y.
-CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=24
+# WiFi/LWIP buffers. The *dynamic* RX/TX pools are kept above IDF defaults to
+# handle sustained HTTPS upload load without `wifi:m f null` starvation — they
+# come from the general heap, so SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y spills them to
+# PSRAM and they cost no internal RAM. The *static* RX pool, by contrast, is
+# DMA-capable and MUST stay in internal RAM even with PSRAM; at 24 buffers
+# (~38 KB) it starved the BLE controller's HCI init ("hci inits failed"), so it
+# stays at the IDF default of 10. TX is made dynamic for the same reason (static
+# TX buffers are also internal-DMA).
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=10
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
@@ -81,6 +106,22 @@ CONFIG_LWIP_TCP_WND_DEFAULT=5760
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# TLS buffers allocate through the standard heap (DEFAULT_MEM_ALLOC): with
+# SPIRAM_USE_MALLOC + ALWAYSINTERNAL=16384, any allocation ≥16 KB lands in PSRAM.
+# This is deliberate and NOT just a memory workaround — it is the only way two
+# concurrent TLS sessions (live MQTT + backlog log upload) can coexist with BLE:
+#   * INTERNAL_MEM_ALLOC pins TLS buffers to internal RAM, where the dynamic
+#     buffer's per-record 16 KB alloc/free churn fragments the heap until the
+#     upload's second ~17 KB buffer can't find a contiguous block (measured:
+#     fine at boot, -0x7F00 SSL_ALLOC_FAILED under load). Two 16 KB buffers +
+#     BLE simply don't fit contiguously in internal RAM on this chip.
+#   * Routing them to the 2 MB PSRAM makes fragmentation a non-issue.
+# The trade-off is software SHA/AES below (HW crypto DMA can't reach PSRAM). That
+# cost is small: the expensive asymmetric math (MBEDTLS_HARDWARE_MPI) is already
+# software, and per-record symmetric crypto is tiny at our TLS volume.
+CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_HARDWARE_SHA=n
 
 # Power management — dynamic frequency scaling only. Light sleep is off
 # (esp_pm_configure() in main.c sets light_sleep_enable=false): continuous

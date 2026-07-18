@@ -35,11 +35,6 @@ extern QueueHandle_t record_writer_queue;
 extern QueueHandle_t mqtt_publisher_queue;
 extern QueueHandle_t ble_publisher_queue;
 
-// Allocate the 64 KB FFT twiddle table from internal RAM. Must be called from
-// app_main BEFORE wifi_connect / ble_publisher tasks start, so the contiguous
-// chunk is reserved before WiFi/BLE drivers consume the heap.
-esp_err_t audio_dsp_preinit(void);
-
 void audio_dsp(void* params);
 
 // Snapshot of the sliding-window aggregates. Each value is a uint8 in

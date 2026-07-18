@@ -133,8 +133,8 @@ static void flush_to_file(time_t window_start) {
   fclose(file);
 
   // Nudge the uploader to pick up the new file. Look it up by name rather than
-  // holding a handle; it may be absent (e.g. DEV_NO_NET disables the uploader)
-  // or have exited, in which case xTaskNotify(NULL) would assert.
+  // holding a handle; it may be absent or have exited, in which case
+  // xTaskNotify(NULL) would assert.
   if (ok) {
     TaskHandle_t uploader = xTaskGetHandle(LOG_UPLOADER_TASK);
     if (uploader) xTaskNotify(uploader, 0, eIncrement);

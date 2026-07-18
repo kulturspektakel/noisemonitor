@@ -68,15 +68,13 @@ to PSRAM via `EXT_RAM_BSS_ATTR` regardless.
   between `main.c` and `audio_dsp.c`.
 - **Benefit:** Removes a fragile cross-file ordering requirement.
 
-### 3. Radix-2 FFT instead of radix-4
-- **Where:** `main/audio_dsp.c:36-43`
-- **What:** Using `dsps_fft2r_fc32_ansi` (16 KB twiddle table) instead of
-  `dsps_fft4r_fc32` (64 KB twiddle table).
-- **Why:** 64 KB doesn't fit contiguously after WiFi+BLE init.
-- **Revert:** Switch to radix-4; put the table in PSRAM via
-  `EXT_RAM_BSS_ATTR`. Radix-4 is ~2× faster than radix-2.
-- **Benefit:** More DSP idle time → more time in light sleep → battery win.
-  Not a code-complexity revert, but a performance recovery.
+### 3. Radix-2 FFT instead of radix-4 — **Resolved differently (2026-07): SIMD radix-2**
+- **What changed:** Rather than switching to radix-4, we enabled the hardware
+  SIMD radix-2 kernel (`dsps_fft2r_fc32_aes3`) — see the "ANSI FFT" row in
+  Section 2. SIMD radix-2 is faster than *ANSI* radix-4 and keeps the small 16 KB
+  twiddle table (radix-4 needs 64 KB), so radix-4 was not worth doing.
+- **Status:** No further action. Radix-4 remains a theoretical option but has no
+  compelling case now that the SIMD radix-2 path works.
 
 ### 4. BLE-first startup ordering (`BLE_HOST_READY` event bit) — **Done early**
 - **Status:** Removed. `BLE_HOST_READY` no longer exists in
@@ -167,7 +165,7 @@ These are correct/legitimate decisions independent of heap pressure. Do
 | `cached_buf[128]` in `ble_publisher.c` | One small static buffer for on-demand BLE reads. Trivial. |
 | Power management (`CONFIG_PM_ENABLE`, tickless idle, 160 MHz default) | Battery life, not memory. |
 | LittleFS partition layout + one-aggregated-record-per-file (per-minute) | Storage/durability, not memory. |
-| ANSI FFT variants instead of SIMD (`dsps_fft2r_fc32_ansi` not `_aes3`) | Independent bug in esp-dsp SIMD path (`im=1.6` artifact). Stay on ANSI until the upstream bug is fixed. |
+| ~~ANSI FFT variants instead of SIMD~~ **Superseded (2026-07): now on `dsps_fft2r_fc32_aes3` SIMD.** The `im=1.6` artifact was not an esp-dsp bug — it was an unaligned `fft_work` (aes3 needs ≥8-byte-aligned data). Fixed with `__attribute__((aligned(16)))`. |
 | `record_to_pb` / `record_apply_aggregates` helpers | Single source of truth for `record_t → NoiseRecording` and 5m/30m stamping. Code quality, not memory. |
 | `audio_dsp` reader + `fft_worker` task split (`audio_dsp.c`) | Decouples I²S read from FFT compute so the DMA pool can stay small and FFT slowdowns don't drop samples. Architectural; keep regardless of PSRAM. |
 | Wall-clock-paced `WORK_EMIT` (`audio_dsp.c`, `next_emit_us`) | Pins record emission to 1 Hz wall clock instead of sample count. Correctness for server-side `measuredAt` reconstruction; keep regardless of PSRAM. |
