@@ -16,7 +16,7 @@ if [ -z "$IDF_PATH" ]; then
     exit 1
 fi
 
-PORT="${ESPPORT:-/dev/tty.usbmodem201301}"
+PORT="${ESPPORT:-/dev/tty.usbmodem101}"
 
 echo "Enter device name (1-16 chars, [A-Za-z0-9äßöü-]):"
 read -r DEVICE_NAME
@@ -44,7 +44,22 @@ fi
 TEMP_DIR=$(mktemp -d)
 echo -n "$DEVICE_NAME" | dd bs=32 conv=sync status=none of="$TEMP_DIR/device_id.bin"
 
-python "$IDF_PATH/components/esptool_py/esptool/espefuse.py" \
+# Locate espefuse. Newer ESP-IDF installs it as a package in the espressif
+# Python env rather than as a file under components/esptool_py/esptool/.
+if command -v espefuse.py >/dev/null 2>&1; then
+    ESPEFUSE=(espefuse.py)
+elif command -v espefuse >/dev/null 2>&1; then
+    ESPEFUSE=(espefuse)
+elif python -c "import espefuse" >/dev/null 2>&1; then
+    ESPEFUSE=(python -m espefuse)
+else
+    echo "ERROR: espefuse not found. Activate the ESP-IDF environment first:" >&2
+    echo "  . \"\$IDF_PATH/export.sh\"" >&2
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+"${ESPEFUSE[@]}" \
     --port "$PORT" --chip esp32s3 \
     burn_block_data BLOCK3 "$TEMP_DIR/device_id.bin"
 
