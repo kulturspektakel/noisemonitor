@@ -448,8 +448,14 @@ static void run_fft_and_accumulate(int head_snapshot) {
   // frequency-quantization error that overestimates tones between band
   // centers — especially at low frequencies where bands are only a few bins
   // wide.
+  //
+  // Restrict the sum to the calibrated band range [16 Hz, 16 kHz). Bins above
+  // the top band edge carry the INMP441's uncalibrated HF resonance (apply_band_cal
+  // only folds cal up to band_start_bin[NOISE_BANDS]); at 48 kHz sampling that
+  // resonance sits near 18-22 kHz where A-weighting only attenuates ~10 dB, so
+  // leaving it in inflated LAeq by ~7 dB above the (calibrated) band sum.
   float a_sum = 0.0f, c_sum = 0.0f;
-  for (int k = 1; k < FFT_SIZE / 2; k++) {
+  for (int k = band_start_bin[0]; k < band_start_bin[NOISE_BANDS]; k++) {
     float re = fft_work[2 * k];
     float im = fft_work[2 * k + 1];
     float bin_energy = re * re + im * im;

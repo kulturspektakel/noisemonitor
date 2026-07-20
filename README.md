@@ -221,10 +221,15 @@ For frequency response verification, switch from sine to **pink noise** — it a
 
 ## Build & flash
 
-Standard ESP-IDF v5.4+ flow. The shell tooling requires `click<8.2` pinned (see `~/.claude/projects/.../memory/build_env.md`).
+**Pinned to ESP-IDF v5.4.1.** Do *not* build with a newer IDF: 5.4.4's larger
+WiFi/NimBLE/mbedtls footprint exhausts internal RAM at boot, so BLE advertising
+malloc-fails and the MQTT client task can't be created (verified on-device
+2026-07). The pin is enforced in the top-level `CMakeLists.txt`. The shell
+tooling also requires `click<8.2` pinned (see
+`~/.claude/projects/.../memory/build_env.md`).
 
 ```bash
-source ~/.espressif/v5.4.4/esp-idf/export.sh
+source ~/esp/v5.4.1/esp-idf/export.sh
 idf.py set-target esp32s3
 idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor
