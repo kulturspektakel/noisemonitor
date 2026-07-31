@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+#include "heap_diag.h"
 #include "mqtt_client.h"
 
 static const char* TAG = "mqtt_publisher";
@@ -34,10 +35,9 @@ static void mqtt_event_handler(
     case MQTT_EVENT_CONNECTED:
       ESP_LOGI(TAG, "MQTT connected");
       mqtt_connected = true;
-      xEventGroupSetBits(event_group, MQTT_CONNECTED);
-      // Kick log_uploader so it retries any backlog whose first attempt
-      // missed because mbedtls couldn't allocate while MQTT was still
-      // setting up its own TLS.
+      // Opportunistic kick for log_uploader: MQTT coming up is a decent proxy
+      // for "the network is healthy". Not required — wifi_connect notifies on
+      // link-up, which is the uploader's only real precondition.
       {
         TaskHandle_t h = xTaskGetHandle(LOG_UPLOADER_TASK);
         if (h) xTaskNotify(h, 0, eNoAction);
@@ -46,7 +46,6 @@ static void mqtt_event_handler(
     case MQTT_EVENT_DISCONNECTED:
       ESP_LOGI(TAG, "MQTT disconnected");
       mqtt_connected = false;
-      xEventGroupClearBits(event_group, MQTT_CONNECTED);
       break;
     case MQTT_EVENT_ERROR:
       ESP_LOGW(TAG, "MQTT error");
@@ -67,12 +66,33 @@ void mqtt_publisher(void* params) {
   };
   mqtt_client = esp_mqtt_client_init(&cfg);
   esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
-  esp_mqtt_client_start(mqtt_client);
+
+  // esp_mqtt_client_start() spawns a task whose 6144 B stack must be contiguous
+  // internal RAM, so it can fail under memory pressure. Retrying the same handle
+  // is safe: on xTaskCreate failure esp-mqtt allocates nothing and leaves state
+  // at MQTT_STATE_INIT. Retry from inside the drain loop rather than a blocking
+  // prologue — audio_dsp enqueues a record every second, so a publisher that
+  // stops receiving overflows the 16-deep queue.
+  bool started = false;
+  TickType_t next_attempt = 0;
 
   while (true) {
-    record_t r;
-    if (xQueueReceive(mqtt_publisher_queue, &r, portMAX_DELAY) != pdTRUE) continue;
+    if (!started && xTaskGetTickCount() >= next_attempt) {
+      esp_err_t err = esp_mqtt_client_start(mqtt_client);
+      if (err == ESP_OK) {
+        started = true;
+      } else {
+        ESP_LOGW(TAG, "mqtt start failed (%s); retrying in 10 s", esp_err_to_name(err));
+        heap_diag("mqtt start failed");
+        next_attempt = xTaskGetTickCount() + pdMS_TO_TICKS(10000);
+      }
+    }
 
+    record_t r;
+    TickType_t wait = started ? portMAX_DELAY : pdMS_TO_TICKS(1000);
+    if (xQueueReceive(mqtt_publisher_queue, &r, wait) != pdTRUE) continue;
+
+    // mqtt_connected implies started — MQTT_EVENT_CONNECTED can't fire otherwise.
     bool wifi_ok = (xEventGroupGetBits(event_group) & WIFI_CONNECTED) != 0;
     if (!wifi_ok || !mqtt_connected) continue;  // drop silently per §9
 

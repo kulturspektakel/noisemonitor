@@ -161,7 +161,27 @@ These are correct/legitimate decisions independent of heap pressure. Do
 | `CONFIG_BT_NIMBLE_MAX_BONDS=0` | We don't pair. Correct. |
 | `CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1` | We accept one client. Correct. |
 | `CONFIG_BT_CTRL_BLE_MAX_ACT=2` | We tried 1 and the controller returned `BLE_ERR_MEM_CAPACITY` on `ble_gap_adv_start`. 2 is the correct minimum for advertising + the eventual incoming connection slot. |
-| Per-bin A/C weighting tables (16 KB BSS) | Correctness — band-center weighting drifts up to 0.5 dB on broadband signal. Tag `EXT_RAM_BSS_ATTR` if you want them in PSRAM. |
+| Per-bin A/C weighting tables (16 KB BSS) | Correctness — band-center weighting drifts up to 0.5 dB on broadband signal. **Now in PSRAM (2026-07)**, along with `hann_window` — see the placement rule below. |
+
+### DSP table placement rule
+
+Internal RAM is the scarce resource: it backs every task stack, and there is
+~110 KB of it against 2 MB of PSRAM. When `audio_dsp`'s statics grew to 100 KB
+they left only ~7 KB contiguous, and `esp_mqtt_client_start()` began failing
+with "Error create mqtt task" — a silent, whole-uptime MQTT outage.
+
+Split DSP tables by **access pattern**, not by size:
+
+| Access pattern | Placement | Examples |
+|---|---|---|
+| Streamed sequentially, once per FFT | PSRAM (`EXT_RAM_BSS_ATTR`) — the cache prefetches whole 32 B lines, so cost is near zero | `hann_window`, `a_weight_bin`, `c_weight_bin` |
+| Random / strided / repeatedly indexed | Internal | `fft_work` (in-place SIMD butterflies), `fft_table` (twiddle lookups) |
+| Written per sample, read out of order | Internal | `fft_ring` |
+| DMA / driver destination | Internal | `raw_buffer` |
+
+Applying this freed 32 KB: DIRAM `.bss` 109,184 → 76,416 B, largest contiguous
+internal block 7,168 → 22,528 B. Measured on device with no DSP regression
+(zero dropped records, exactly 1.00 publishes/sec).
 | `cached_buf[128]` in `ble_publisher.c` | One small static buffer for on-demand BLE reads. Trivial. |
 | Power management (`CONFIG_PM_ENABLE`, tickless idle, 160 MHz default) | Battery life, not memory. |
 | LittleFS partition layout + one-aggregated-record-per-file (per-minute) | Storage/durability, not memory. |

@@ -162,15 +162,10 @@ void log_uploader(void* params) {
     xTaskNotifyWait(0, ULONG_MAX, &increment, portMAX_DELAY);
     log_files_to_upload += increment;
 
-    // Gate on MQTT being up, not just WiFi: at boot MQTT's TLS handshake
-    // grabs a contiguous mbedtls IN+OUT buffer pair (~8 KB), and if we
-    // start our own HTTPS handshake at the same instant the second
-    // mbedtls_ssl_setup hits MBEDTLS_ERR_SSL_ALLOC_FAILED. Once MQTT is
-    // connected it holds those buffers steadily; the heap shape is
-    // predictable and our handshake finds the contiguous chunk it needs.
-    bool ready = (xEventGroupGetBits(event_group) & (WIFI_CONNECTED | MQTT_CONNECTED))
-                 == (WIFI_CONNECTED | MQTT_CONNECTED);
-    if (log_files_to_upload == 0 || !ready) {
+    // Upload is plain HTTPS; WiFi is its only precondition. (This also gated on
+    // MQTT_CONNECTED as a proxy for mbedtls heap headroom — obsolete post-PSRAM,
+    // and it silently deadlocked the backlog whenever MQTT failed to start.)
+    if (log_files_to_upload == 0 || !(xEventGroupGetBits(event_group) & WIFI_CONNECTED)) {
       continue;
     }
 
@@ -220,12 +215,10 @@ void log_uploader(void* params) {
     }
 
     if (log_files_to_upload > 0) {
-      // 30 s retry. The boot-time SSL handshake race (heap still
-      // settling from MQTT init, mbedtls_ssl_setup hits ALLOC_FAILED)
-      // resolves within seconds, so 5 min was overkill and made the
-      // backlog drain at ~one-file-per-5-min worst case. With 30 s
-      // a backlog of N files drains in about N×(upload_time+30 s)
-      // assuming subsequent uploads succeed once heap is stable.
+      // 30 s retry: transient upload failures clear within seconds, so a
+      // backlog of N files drains in about N×(upload_time+30 s) worst case.
+      // (Was 5 min, tuned against a boot-time mbedtls alloc race that no
+      // longer exists post-PSRAM; that made the worst case one file per 5 min.)
       if (retry_timer == NULL) {
         retry_timer =
             xTimerCreate("retry_timer", pdMS_TO_TICKS(30000), pdFALSE, NULL, retry_upload);

@@ -116,12 +116,36 @@ CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 #     fine at boot, -0x7F00 SSL_ALLOC_FAILED under load). Two 16 KB buffers +
 #     BLE simply don't fit contiguously in internal RAM on this chip.
 #   * Routing them to the 2 MB PSRAM makes fragmentation a non-issue.
-# The trade-off is software SHA/AES below (HW crypto DMA can't reach PSRAM). That
-# cost is small: the expensive asymmetric math (MBEDTLS_HARDWARE_MPI) is already
-# software, and per-record symmetric crypto is tiny at our TLS volume.
+# The trade-off is software SHA/AES below. Per-record symmetric crypto is tiny
+# at our TLS volume, so the cost is small.
 CONFIG_MBEDTLS_DEFAULT_MEM_ALLOC=y
+# AES/SHA stay software. Not because the S3's GDMA can't reach PSRAM — it can
+# (SOC_PSRAM_DMA_CAPABLE=1, and esp_aes_dma_core.c's s_check_dma_capable() uses
+# esp_ptr_dma_ext_capable() under CONFIG_SPIRAM). The blocker is *alignment*:
+# "output buffers in external ram needs to be 16-byte aligned"
+# (esp_aes_dma_core.c:197), and unaligned PSRAM buffers fall into
+# esp_aes_process_dma_ext_ram(), which mallocs an internal 1600 B chunk buffer
+# per operation — the `esp-aes: Failed to allocate memory` seen in the 2026-07
+# "design B" attempt. Re-enabling means guaranteeing 16 B alignment on the
+# mbedtls record buffers in PSRAM; not worth reopening the fragmentation risk.
 CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_MBEDTLS_HARDWARE_SHA=n
+# MPI (RSA accelerator) also stays off, but for a different reason than AES/SHA
+# — not memory at all. esp_bignum.c uses no DMA (operands go into RSA peripheral
+# memory via the CPU), so it is safe to enable alongside TLS-in-PSRAM. It was
+# tried on device 2026-07-30 and measured *no* improvement: upload wall time
+# stayed at ~700 ms median (software baseline n=196: median 700 ms, min 660 ms).
+# The reason is that the S3 has no ECC accelerator (SOC_ECC_SUPPORTED is absent;
+# only C2/C5/C6/C61/H2/P4 have one), so ECDHE P-256 stays in software and
+# dominates the handshake along with network RTT. RSA verify — the part MPI
+# accelerates — was never the bottleneck. Enable it if the mqtts:// switch makes
+# certificate verification frequent enough to matter, and re-measure.
+#
+# Not an IRAM constraint, despite appearances: `idf.py size` reports
+# IRAM 16383/16384 ("99.99%"), but that row is only the instruction-only SRAM0
+# half of iram0_0_seg. The segment is 358144 B; the DIRAM row is the other
+# 341760 B of it. IRAM_ATTR code spills into DIRAM (~143 KB free) — verified by
+# enabling MBEDTLS_MPI_USE_INTERRUPT, whose IRAM_ATTR ISR linked into DIRAM.
 
 # Power management — dynamic frequency scaling only. Light sleep is off
 # (esp_pm_configure() in main.c sets light_sleep_enable=false): continuous

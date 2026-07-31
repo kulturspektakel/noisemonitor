@@ -102,6 +102,14 @@ QueueHandle_t ble_publisher_queue;
 // --- Static buffers ---------------------------------------------------------
 static i2s_chan_handle_t i2s_rx;
 
+// Placement rule for the DSP tables (see PSRAM_MIGRATION.md §2): internal RAM
+// is the scarce resource — it backs every task stack. Tables that are streamed
+// sequentially go to PSRAM, where the cache prefetches whole lines; tables that
+// are randomly or repeatedly indexed stay internal.
+//
+// raw_buffer: i2s_channel_read() destination, written every 21 ms — internal.
+// fft_ring:   written per sample (48k/s) at a wrapping head, read out of order
+//             (head_snapshot + i) & mask during windowing — internal.
 static int32_t  raw_buffer[I2S_BUFFER_FRAMES];     // raw 24-in-32-bit samples
 static float    fft_ring[FFT_SIZE];                // last FFT_SIZE float samples
 static int      fft_ring_head = 0;                 // next write index
@@ -124,12 +132,11 @@ static float    fft_energy_to_spl_db;   // ≈ +58.0 — added to every energy->
 static float    peak_to_spl_db;         // ≈ +123.0 — LCpeak amplitude->dB
 
 // Per-bin A and C weighting (linear power factors), populated at init from
-// IEC 61672 formulas. 8 KB each, internal BSS. Read on every FFT in the band
-// accumulation loop, so they stay in internal RAM with the rest of the FFT hot
-// path. Avoid the band-center approximation for LAeq/LCeq — apply weighting at
-// each bin's exact frequency instead.
-static float    a_weight_bin[FFT_SIZE / 2];
-static float    c_weight_bin[FFT_SIZE / 2];
+// IEC 61672 formulas. Avoid the band-center approximation for LAeq/LCeq — apply
+// weighting at each bin's exact frequency instead.
+// In PSRAM (8 KB each): streamed once per FFT by the A/C accumulation loop.
+EXT_RAM_BSS_ATTR static float a_weight_bin[FFT_SIZE / 2];
+EXT_RAM_BSS_ATTR static float c_weight_bin[FFT_SIZE / 2];
 
 // Per-second energy accumulators
 static double   band_energy_sum[NOISE_BANDS];
@@ -170,13 +177,9 @@ EXT_RAM_BSS_ATTR static float lceq_ring[RING_30M];
 static int      ring_idx = 0;
 static int      total_seconds = 0;
 
-// Pre-computed Hann window. The original code computed this on the fly
-// (cosf in the FFT inner loop). cosf lives in newlib (flash); during a
-// record_writer flash erase, the cache-disabled window resolves cosf to
-// a bogus address and the audio_dsp task panics on the next FFT. Caching
-// the window in BSS keeps the hot path entirely off flash for this term,
-// and also saves ~9 ms/sec of CPU.
-static float    hann_window[FFT_SIZE];
+// Pre-computed Hann window; saves ~9 ms/sec vs. calling cosf in the FFT inner
+// loop. In PSRAM: streamed once per FFT by the windowing loop.
+EXT_RAM_BSS_ATTR static float hann_window[FFT_SIZE];
 
 static uint32_t seq_no = 0;
 
