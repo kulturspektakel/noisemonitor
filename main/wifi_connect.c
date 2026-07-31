@@ -14,12 +14,39 @@
 static TimerHandle_t update_timer;
 wifi_status_t wifi_status = DISCONNECTED;
 
-// Retry cadence while disconnected: faster on USB power, slower on battery.
-// The timer only runs while disconnected (disconnects are event-driven), so
-// there's no connected-state case to handle here.
+// Retry cadence while disconnected: exponential backoff from 5 s, doubling to
+// a 10 min ceiling (5, 10, 20, 40, 80, 160, 320, 600, 600...). The timer only
+// runs while disconnected — disconnects are event-driven — so there is no
+// connected-state case to handle here.
+//
+// Was a flat 2 min (USB) / 5 min (battery). That interval was sized for a
+// genuinely absent AP, but it also governed the far more common case, a
+// transient association failure at boot, and made it very expensive: measured
+// repeatedly on 2026-07-30/31, the first attempt failed at t≈2.5 s and the
+// retry that succeeded — on its first try — did not fire until t≈122 s. The
+// device sat offline for two minutes, dropping ~120 live records, for a fault
+// that clears in seconds.
+//
+// The ceiling is now the same on USB and battery. That is better than before
+// on battery (10 min vs 5 min between radio wake-ups) and worse on USB (10 min
+// vs 2 min to recover from a long outage). Note a long ceiling delays but does
+// not lose file data — record_writer keeps writing locally and log_uploader
+// drains the backlog on reconnect; only live MQTT records are dropped. To make
+// the ceiling power-dependent again, branch on USB_CONNECTED here.
+#define WIFI_RETRY_BASE_MS 5000
+#define WIFI_RETRY_MAX_MS  (10 * 60 * 1000)
+
+// Consecutive failed attempts since the last successful association.
+static int retry_attempt = 0;
+
 static int timer_duration() {
-  bool usb_connected = xEventGroupGetBits(event_group) & USB_CONNECTED;
-  return usb_connected ? 60000 * 2 : 60000 * 5;
+  // Loop rather than shift: caps without ever overflowing, however long the
+  // outage runs.
+  int ms = WIFI_RETRY_BASE_MS;
+  for (int i = 0; i < retry_attempt && ms < WIFI_RETRY_MAX_MS; i++) {
+    ms *= 2;
+  }
+  return ms > WIFI_RETRY_MAX_MS ? WIFI_RETRY_MAX_MS : ms;
 }
 
 static void timer_cb(TimerHandle_t timer) {
@@ -42,10 +69,14 @@ static void clearTimer() {
 }
 
 static void startTimer() {
+  int delay_ms = timer_duration();
   clearTimer();
-  update_timer =
-      xTimerCreate("update_timer", pdMS_TO_TICKS(timer_duration()), pdFALSE, 0, timer_cb);
+  update_timer = xTimerCreate("update_timer", pdMS_TO_TICKS(delay_ms), pdFALSE, 0, timer_cb);
   xTimerStart(update_timer, 0);
+  ESP_LOGI(WIFI_CONNECT_TASK, "WiFi retry #%d in %d ms", retry_attempt + 1, delay_ms);
+  // Saturate: timer_duration() has already capped, this just keeps the counter
+  // from growing without bound across a multi-day outage.
+  if (retry_attempt < 16) retry_attempt++;
 }
 
 static void event_handler(
@@ -71,6 +102,7 @@ static void event_handler(
   } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
     ESP_LOGI(WIFI_CONNECT_TASK, "WiFi connected");
     wifi_status = CONNECTED;
+    retry_attempt = 0;  // next outage starts the backoff over at 5 s
     // Modem-sleep (WIFI_PS_MIN_MODEM) per spec §12 — large WiFi power saving
     // when idle. Past concern: iPhone Personal Hotspot used in development
     // drops idle clients after ~10 s when our radio is dozing. If reconnect
@@ -162,6 +194,10 @@ void wifi_connect_trigger(void) {
   // re-enters esp_wifi_connect() and the stack logs "sta is connecting,
   // return error" (same reason the retry timer only notifies when down).
   if (wifi_status == CONNECTED || wifi_status == CONNECTING) return;
+  // An explicit trigger (BLE provisioning, USB plugged in) means something
+  // changed that could fix the connection, so don't make the user wait out a
+  // backoff earned by earlier failures.
+  retry_attempt = 0;
   TaskHandle_t h = xTaskGetHandle(WIFI_CONNECT_TASK);
   if (h != NULL) xTaskNotifyGive(h);
 }
