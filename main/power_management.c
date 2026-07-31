@@ -20,9 +20,19 @@
 
 #define UPDATE_INTERVAL 60000
 
-#define LED_BLUE_PIN GPIO_NUM_40
+// Red and blue are swapped relative to the contactless RevE pinout that
+// NOISE_MONITOR_SPEC.md §2 inherited (which lists red=42, blue=40). Confirmed
+// on this board 2026-07-31 with the status_led boot self-test: driving the red
+// channel lit blue and driving blue lit red, while green was correct.
+//
+// The mismatch hid for so long because green is the middle channel and is
+// unaffected by a red/blue swap — so the healthy "time set + WiFi up" state
+// looked right. What gave it away was a steady blue at boot, which is not a
+// state status_led can emit: it was the amber "recording, no WiFi" colour
+// (255,90,0) coming out as (0,90,255).
+#define LED_RED_PIN GPIO_NUM_40
 #define LED_GREEN_PIN GPIO_NUM_41
-#define LED_RED_PIN GPIO_NUM_42
+#define LED_BLUE_PIN GPIO_NUM_42
 
 int battery_voltage = 0;
 int usb_voltage = 0;

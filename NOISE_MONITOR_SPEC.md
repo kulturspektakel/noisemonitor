@@ -27,12 +27,14 @@ Build a battery- or USB-powered ESP32-S3 device that continuously measures ambie
 
 Pins for RGB LED, DS3231 RTC, USB voltage, and battery voltage match the contactless project (RevE) so the same code reuses them without modification. Microphone pins are new.
 
+> **Correction (2026-07-31): the LED red/blue pins do NOT match RevE on this board.** This section originally carried RevE's red=42 / blue=40, and `power_management.c` matched it — but on the noise-monitor hardware GPIO 40 is red and GPIO 42 is blue. Verified with the `status_led` boot self-test, which drives red → green → blue and was observed as blue → green → red. The error was invisible in normal operation because green is the middle channel and survives a red/blue swap, so the healthy "time set + WiFi up" state looked correct; the tell was a steady blue at boot, which `status_led` cannot emit — it was amber (255,90,0) rendering as (0,90,255).
+
 ```
 Function                     GPIO    Source
 ─────────────────────────────────────────────────────────────────────
-LED red                      42      contactless power_management.c (LED_RED_PIN)
+LED red                      40      CORRECTED 2026-07-31 — see note below
 LED green                    41      contactless power_management.c (LED_GREEN_PIN)
-LED blue                     40      contactless power_management.c (LED_BLUE_PIN)
+LED blue                     42      CORRECTED 2026-07-31 — see note below
 I²C SDA   (DS3231)           39      contactless rfid.c / time_sync.c
 I²C SCL   (DS3231)           38      contactless rfid.c / time_sync.c
 I²C port                     I2C_NUM_0
