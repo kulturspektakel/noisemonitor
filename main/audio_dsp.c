@@ -22,8 +22,10 @@
 static const char* TAG = "audio_dsp";
 
 // --- Optional: synthesize audio in software ---------------------------------
-// Set to 1 to bypass the mic and inject a synthetic signal through the DSP
-// pipeline (useful for testing the rest of the chain without a working mic).
+// Set to 1 to bypass the mic and inject a steady sine of known frequency and
+// amplitude through the DSP pipeline. Used to validate the chain against an
+// analytic expectation and against the reference analyser (CALIBRATION.md §2.2)
+// — see the SIM_TONE_* block below for the expected output.
 #define SIMULATE_MIC 0
 
 // --- I²S configuration --------------------------------------------------------
@@ -80,13 +82,14 @@ static const float band_centers[NOISE_BANDS] = {
     16000
 };
 
-// Per-band frequency-response correction for the INMP441 chain, in dB
-// (added in dB-space; positive = "this band reads low, push it up").
-// Folded into the per-bin A/C weights and the band-sum multiplier, so it
-// corrects the 31-band display, LAeq, LCeq, LAFmax, and LCFmax. This is now
-// the ONLY calibration knob (the old scalar offset is gone — the fixed
-// FFT-energy->dB-SPL anchor lives in dsp_init). Loaded from NVS at init and
-// re-loaded whenever a new calibration arrives over BLE (see reload_band_cal).
+// Per-band frequency-response correction for the mic chain, in dB (added in
+// dB-space; positive = "this band reads low, push it up"). Defined at the band
+// CENTRE frequencies above — apply_band_cal() interpolates between them in
+// log-frequency to get a per-bin curve, which corrects the 31-band display,
+// LAeq, LCeq, LAFmax and LCFmax identically. This is the ONLY calibration knob
+// (the old scalar offset is gone — the fixed FFT-energy->dB-SPL anchor lives in
+// dsp_init). Loaded from NVS at init and re-loaded whenever a new calibration
+// arrives over BLE (see reload_band_cal).
 // LCpeak only gets the mean of these (it's a time-domain metric).
 // All zeros = no correction (raw values already near dB SPL via the anchor).
 static float band_cal_offset_db[NOISE_BANDS] = { 0 };
@@ -125,7 +128,6 @@ static float    fft_work[FFT_SIZE * 2] __attribute__((aligned(16)));  // complex
 // array (not an early heap grab) is what let audio_dsp_preinit() go away.
 static float    fft_table[FFT_SIZE] __attribute__((aligned(16)));
 static int      band_start_bin[NOISE_BANDS + 1];   // inclusive start; one extra = exclusive end of last band
-static float    band_cal_lin[NOISE_BANDS];          // 10^(band_cal_offset_db / 10)
 
 // dB-SPL anchor constants, computed once in dsp_init (see MIC_DBFS_TO_SPL_DB).
 static float    fft_energy_to_spl_db;   // ≈ +58.0 — added to every energy->dB
@@ -135,8 +137,17 @@ static float    peak_to_spl_db;         // ≈ +123.0 — LCpeak amplitude->dB
 // IEC 61672 formulas. Avoid the band-center approximation for LAeq/LCeq — apply
 // weighting at each bin's exact frequency instead.
 // In PSRAM (8 KB each): streamed once per FFT by the A/C accumulation loop.
+// NOTE: apply_band_cal() multiplies the per-bin calibration factor into these,
+// so they are NOT pure IEC weights after init — see reload_band_cal().
 EXT_RAM_BSS_ATTR static float a_weight_bin[FFT_SIZE / 2];
 EXT_RAM_BSS_ATTR static float c_weight_bin[FFT_SIZE / 2];
+
+// Per-bin calibration factor (linear power), interpolated in log-frequency
+// between the 31 band-centre offsets by apply_band_cal(). Used directly by the
+// band-sum loop; the same factor is also folded into a_weight_bin/c_weight_bin
+// above, so the 31-band display and LAeq/LCeq always carry an identical
+// correction. In PSRAM (8 KB): streamed once per FFT alongside the weights.
+EXT_RAM_BSS_ATTR static float cal_lin_bin[FFT_SIZE / 2];
 
 // Per-second energy accumulators
 static double   band_energy_sum[NOISE_BANDS];
@@ -200,39 +211,73 @@ static uint32_t minute_seq_no = 0;
 static time_t   min_window_start = 0;  // wall-clock time of this interval's first second
 
 #if SIMULATE_MIC
-// Four tones at frequencies spread across the 1/3-octave bands, each with its
-// own slow LFO modulating its amplitude. The LFO periods are coprime so the
-// composite spectrum shifts continuously — LAeq swings ~15 dB over time and
-// different band[] cells light up at different moments. Plus a white-noise
-// floor that contributes broadband content to every band.
-// Replace with real I²S (SIMULATE_MIC=0) once the INMP441 is wired.
-#define SIM_TONE_COUNT 4
-static const float sim_tone_freq[SIM_TONE_COUNT]    = {  80.0f, 500.0f, 2000.0f, 8000.0f };
-static const float sim_tone_amp[SIM_TONE_COUNT]     = {   0.10f,  0.08f,   0.06f,   0.04f };
-static const float sim_tone_lfo_hz[SIM_TONE_COUNT]  = {   0.05f,  0.07f,   0.11f,   0.13f };
-static const float sim_noise_amp                    = 0.01f;
+// A single steady sine at a known frequency and amplitude, injected in place of
+// the I²S mic. This exists to validate the DSP chain against an *analytic*
+// expectation and against an independent reimplementation (see CALIBRATION.md
+// §2.2) — not to look like realistic audio. The previous version summed four
+// LFO-modulated tones plus a noise floor, which was useful for exercising the
+// UI but produced nothing you could check a number against.
+//
+// Amplitude is specified in dBFS, defined so 0 dBFS is a full-scale sine
+// (peak = 1.0). The peak amplitude is therefore A = 10^(dBFS/20).
+//
+// EXPECTED OUTPUT — with an all-zero calibration, the band containing
+// SIM_TONE_HZ should report:
+//
+//     band_dB = SIM_TONE_DBFS + MIC_DBFS_TO_SPL_DB
+//
+// Derivation: for a sine of peak amplitude A the mean single-sided Hann-windowed
+// FFT energy is (N/2)·(3N/8)·A²/2 = (3N²/16)·A²/2, and dsp_init sets
+// fft_energy_to_spl_db = MIC_DBFS_TO_SPL_DB + 10log10(2) − 10log10(3N²/16), so
+// the 10log10(3N²/16) terms cancel and only 20log10(A) + MIC_DBFS_TO_SPL_DB
+// survives. LAeq should equal the same value plus the IEC 61672 A-weighting at
+// SIM_TONE_HZ, which is 0 dB at 1 kHz — so at the defaults below, both the
+// 1 kHz band and LAeq should read 94.0 dB, matching the ICS-43434's spec point
+// (−26 dBFS @ 94 dB SPL).
+//
+// Verified offline against a NumPy reimplementation of this pipeline (2026-08):
+// the loudest band reads SIM_TONE_DBFS + 120 to within 0.000 dB at −6, −26 and
+// −46 dBFS, and at 1 kHz and 4 kHz. Hann scalloping splits an off-bin tone
+// across neighbouring bins but the band sum recovers all of it, so the band
+// level is exact at any frequency inside a band.
+//
+// LAeq additionally carries the A-weighting at the tone frequency. For a tone
+// sitting exactly on a bin (a multiple of SAMPLE_RATE/FFT_SIZE = 11.71875 Hz)
+// that is simply a_weight_bin[k]; for an off-bin tone it is the energy-weighted
+// average over the bins the tone spreads into, which at 1 kHz differs from the
+// nearest-bin value by ~0.01 dB. Use an on-bin frequency for the tightest check.
+//
+// Useful choices of SIM_TONE_HZ:
+//    996.09375 -> exactly on bin 85, A-weight ≈ 0 dB; cleanest analytic check
+//   1000.0     -> A-weighting is 0 dB at 1 kHz by definition; band and LAeq
+//                 both read 94.00 at −26 dBFS
+//   1113.28125 -> band_start_bin[19], i.e. a band edge; checks edge assignment
+//   4000.0     -> A-weight +0.965 dB, so LAeq should read 94.965 at −26 dBFS
+#define SIM_TONE_HZ    1000.0f
+#define SIM_TONE_DBFS  (-26.0f)
 
-static uint32_t sim_phase = 0;
-static uint32_t sim_rng = 0x12345678u;
+// Phase kept in double radians and wrapped, rather than as t = sample_index/SR:
+// a float t loses resolution as the index grows, which slowly detunes the tone
+// and makes long runs non-reproducible.
+static double sim_phase = 0.0;
+
 static void fill_simulated_buffer(int32_t* dst, int n) {
-  const float inv_sr = 1.0f / (float)SAMPLE_RATE;
-  const float two_pi = 2.0f * (float)M_PI;
-  for (int i = 0; i < n; i++) {
-    float t = (float)sim_phase * inv_sr;
-    // Global envelope: 30 s period, ranges 0.05..1.0 → ~26 dB peak-to-peak
-    // amplitude swing so LAeq is visibly rising and falling.
-    float global_env = 0.05f + 0.95f * (0.5f + 0.5f * sinf(two_pi * 0.033f * t));
-    float sample = 0.0f;
-    for (int k = 0; k < SIM_TONE_COUNT; k++) {
-      float lfo = 0.5f + 0.5f * sinf(two_pi * sim_tone_lfo_hz[k] * t);
-      sample += sim_tone_amp[k] * lfo * sinf(two_pi * sim_tone_freq[k] * t);
-    }
-    sample *= global_env;
-    sim_rng = sim_rng * 1664525u + 1013904223u;  // LCG noise (always-on floor)
-    sample += sim_noise_amp * ((int32_t)(sim_rng >> 8) / 8388608.0f - 0.5f) * 2.0f;
-    sim_phase++;
+  const double two_pi = 2.0 * M_PI;
+  const double dphi = two_pi * (double)SIM_TONE_HZ / (double)SAMPLE_RATE;
+  const double amp = pow(10.0, (double)SIM_TONE_DBFS / 20.0);
 
-    int32_t s24 = (int32_t)(sample * 8388608.0f);
+  for (int i = 0; i < n; i++) {
+    // Phase accumulates in double (precision where it matters) but the sine
+    // itself is single-precision: the S3 FPU has no double unit, so double sin()
+    // is software-emulated, and sinf() on a phase already reduced to [0, 2π)
+    // carries ~1e-7 error — irrelevant next to 24-bit quantisation.
+    float sample = (float)amp * sinf((float)sim_phase);
+    sim_phase += dphi;
+    if (sim_phase >= two_pi) sim_phase -= two_pi;
+
+    // Match the real I²S format: 24-bit signed, left-aligned in a 32-bit slot.
+    // The reader undoes this with (raw >> 8) / 2^23.
+    int32_t s24 = (int32_t)lroundf(sample * 8388608.0f);
     if (s24 >  8388607)  s24 =  8388607;
     if (s24 < -8388608)  s24 = -8388608;
     dst[i] = s24 << 8;
@@ -327,22 +372,56 @@ static void compute_bin_weights(void) {
   }
 }
 
-// Fold per-band cal into the per-bin A/C weights and pre-compute the
-// linear-power factor used by the band-sum multiplier. Each bin gets
-// the highest-indexed band whose [start, next_start) range covers it
-// — overlaps at low frequencies resolve to last-band-wins. Bins above
-// the top band's edge are left untouched.
+// Expand the 31 per-band offsets onto every FFT bin by linear interpolation in
+// log-frequency between band centres, held flat below the first centre (16 Hz)
+// and above the last (16 kHz). The result is written to cal_lin_bin[] as a
+// linear power factor and multiplied into the per-bin A/C weights, so the
+// band-sum loop and the LAeq/LCeq accumulation apply the *same* correction.
+//
+// This replaces an earlier scheme that assigned each bin to "the highest-indexed
+// band whose [start, next_start) range covers it". That was wrong in two ways at
+// low frequency, where bin spacing (11.72 Hz at 48 kHz / 4096) is wider than the
+// bands themselves:
+//   - The 20 Hz and 25 Hz lower edges both quantise to bin 2, as does 31.5 Hz.
+//     Last-band-wins gave bin 2 to 31.5 Hz, so the 20 and 25 Hz offsets never
+//     reached the A/C weights at all — they moved the band display but not
+//     LAeq/LCeq, leaving the two inconsistent.
+//   - A piecewise-constant correction puts a step at every band edge, which is
+//     not how a microphone's response behaves.
+// Interpolating over centres is immune to both: every bin gets a value derived
+// from the curve, so no band can be skipped, and the curve is continuous.
+//
+// Cost is irrelevant — this runs at init and on a calibration write, not per FFT.
 static void apply_band_cal(void) {
-  for (int b = 0; b < NOISE_BANDS; b++) {
-    band_cal_lin[b] = powf(10.0f, band_cal_offset_db[b] / 10.0f);
-  }
+  const float bin_hz = (float)SAMPLE_RATE / (float)FFT_SIZE;
+
+  // Band centres in log10(Hz). Ascending, so the bracket search below only ever
+  // moves forward as bins ascend in frequency.
+  float log_fc[NOISE_BANDS];
+  for (int b = 0; b < NOISE_BANDS; b++) log_fc[b] = log10f(band_centers[b]);
+
+  cal_lin_bin[0] = 0.0f;   // DC bin is excluded from every sum
   int b = 0;
-  int top = band_start_bin[NOISE_BANDS];
   for (int k = 1; k < FFT_SIZE / 2; k++) {
-    if (k >= top) break;
-    while (b + 1 < NOISE_BANDS && band_start_bin[b + 1] <= k) b++;
-    a_weight_bin[k] *= band_cal_lin[b];
-    c_weight_bin[k] *= band_cal_lin[b];
+    float lf = log10f((float)k * bin_hz);
+
+    float db;
+    if (lf <= log_fc[0]) {
+      db = band_cal_offset_db[0];
+    } else if (lf >= log_fc[NOISE_BANDS - 1]) {
+      db = band_cal_offset_db[NOISE_BANDS - 1];
+    } else {
+      // Advance to the bracket [log_fc[b], log_fc[b+1]) containing lf. Bounded
+      // so b+1 never exceeds the last band index.
+      while (b + 1 < NOISE_BANDS - 1 && log_fc[b + 1] <= lf) b++;
+      float t = (lf - log_fc[b]) / (log_fc[b + 1] - log_fc[b]);
+      db = band_cal_offset_db[b] + t * (band_cal_offset_db[b + 1] - band_cal_offset_db[b]);
+    }
+
+    float lin = powf(10.0f, db / 10.0f);
+    cal_lin_bin[k] = lin;
+    a_weight_bin[k] *= lin;
+    c_weight_bin[k] *= lin;
   }
 }
 
@@ -427,8 +506,9 @@ static void run_fft_and_accumulate(int head_snapshot) {
   // offset — no per-frame compensation needed.
 
   // Accumulate magnitude-squared into bands (for the 31-band per-second display).
-  // Multiply by band_cal_lin[b] to apply the per-band mic-response cal in
-  // linear-power space — equivalent to adding band_cal_offset_db[b] in dB.
+  // Each bin's energy is scaled by cal_lin_bin[k] — the same interpolated per-bin
+  // calibration factor that apply_band_cal() folded into the A/C weights below,
+  // so the band display and LAeq/LCeq can never disagree about the correction.
   for (int b = 0; b < NOISE_BANDS; b++) {
     int start = band_start_bin[b];
     int end = band_start_bin[b + 1];
@@ -441,9 +521,9 @@ static void run_fft_and_accumulate(int head_snapshot) {
     for (int k = start; k < end; k++) {
       float re = fft_work[2 * k];
       float im = fft_work[2 * k + 1];
-      sum += re * re + im * im;
+      sum += (re * re + im * im) * cal_lin_bin[k];
     }
-    band_energy_sum[b] += (double)sum * (double)band_cal_lin[b];
+    band_energy_sum[b] += (double)sum;
   }
 
   // Per-bin A/C weighted accumulation for LAeq/LCeq. Applying the weight at
@@ -724,7 +804,9 @@ static void fft_worker(void* params) {
 // --- Main task ---------------------------------------------------------------
 void audio_dsp(void* params) {
 #if SIMULATE_MIC
-  ESP_LOGW(TAG, "SIMULATE_MIC=1 — bypassing I²S, injecting 1 kHz sine wave");
+  ESP_LOGW(TAG, "SIMULATE_MIC=1 — bypassing I²S, injecting %.4f Hz sine at %.2f dBFS; "
+                "expect band+LAeq = %.2f dB SPL (uncalibrated)",
+           SIM_TONE_HZ, SIM_TONE_DBFS, SIM_TONE_DBFS + MIC_DBFS_TO_SPL_DB);
 #else
   i2s_init();
 #endif
