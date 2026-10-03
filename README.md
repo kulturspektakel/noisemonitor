@@ -141,7 +141,7 @@ The 31 bands are **unweighted**, so downstream consumers (dashboards, server) ca
 
 ### Sliding-window Leqs at the recording level
 
-`NoiseRecording.laeq_5m / lceq_5m / laeq_30m / lceq_30m` are sliding Leqs over the last 5 and 30 minutes. They share a single ring buffer per channel (`laeq_ring[RING_30M]` and `lceq_ring[RING_30M]`); a single-pass walk via `audio_dsp_get_aggregates` accumulates both window sums at once.
+`NoiseRecording.laeq_5m / lceq_5m / laeq_30m / lceq_30m` are sliding Leqs over the last 5 and 30 minutes. They share a single ring buffer per channel (`laeq_ring[RING_30M]` and `lceq_ring[RING_30M]`). The FFT worker computes both windows once per second; `audio_dsp_get_aggregates` copies a synchronized snapshot, so publishers never scan rings while they are changing.
 
 `RING_30M = 1800` (full 30-min window). The rings live in PSRAM (`EXT_RAM_BSS_ATTR`), so both the 5-min and 30-min windows populate; `has_30m` goes true after 30 min of uptime.
 
@@ -219,6 +219,14 @@ For frequency response verification, switch from sine to **pink noise** — it a
 
 ---
 
+## Recording and recovery
+
+- Queued FFT work owns its samples until processing finishes. Nine fixed 4096-sample buffers in PSRAM use 144 KiB and cover eight queued windows plus the active worker. If the pool or queue fills, the reader drops that FFT instead of processing overwritten samples or blocking I²S.
+- The writer saves each minute aggregate to a `.tmp` file, checks encoding and close, then renames it to `.log`. Only `.log` files are counted, uploaded, or evicted. Incomplete temporary files are removed when the writer starts; failed writes retry after 30 seconds while the record remains in RAM.
+- WiFi reconnect backoff uses task notification timeouts, from 5 seconds to a 10-minute ceiling. Upload retries also use a task timeout, avoiding retry-timer allocation and deletion races.
+- BLE provisioning stores SSID and password together in the versioned `device_config/wifi_creds` NVS blob. Existing `wifi_ssid` and `wifi_password` keys remain readable when the blob is absent, so previously provisioned devices keep working. Firmware that predates the blob format will still see the older credentials if downgraded.
+- RTC data is used only after a successful read and calendar validation. NTP retries after WiFi connects even when the RTC supplied a valid initial time; failed SNTP initialization never proceeds into a synchronization wait.
+
 ## Build & flash
 
 **Pinned to ESP-IDF v5.4.1.** Do *not* build with a newer IDF: 5.4.4's larger
@@ -293,6 +301,6 @@ See [PSRAM_MIGRATION.md](PSRAM_MIGRATION.md) for the full migration history and 
 | `main/calibration.c` | NVS persistence of cal offset, event bit management |
 | `main/mqtt_publisher.c` | Protobuf encode + publish to MQTT broker |
 | `main/ble_publisher.c` | NimBLE GATT server — record-notify, calibration read/write, WiFi credential write |
-| `main/record_writer.c` | Buffer records to LittleFS in 300-record (5-min) log files |
+| `main/record_writer.c` | Save each minute aggregate to LittleFS using checked writes and atomic rename |
 | `main/log_uploader.c` | HTTPS upload of completed log files |
 | `NOISE_MONITOR_SPEC.md` | Original product spec — what we're building and why |

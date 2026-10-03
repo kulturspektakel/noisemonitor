@@ -1,5 +1,7 @@
 #include "log_uploader.h"
 #include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "constants.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -7,6 +9,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "http_auth_headers.h"
+#include "log_storage.h"
 #include "network_request.h"
 
 #define MAX_ERRORS 3
@@ -25,13 +28,13 @@ static int update_log_count() {
 
   if (dir == NULL) {
     ESP_LOGE(LOG_UPLOADER_TASK, "Failed to open directory");
-    return 0;
+    return -1;
   }
 
   struct dirent* entry;
   int count = 0;
   while ((entry = readdir(dir))) {
-    if (entry->d_type == DT_REG) {
+    if (entry->d_type == DT_REG && log_has_suffix(entry->d_name, ".log")) {
       count++;
     }
   }
@@ -61,26 +64,35 @@ static log_uploader_event_t upload_file(char* filename) {
       .method = HTTP_METHOD_POST,
   };
 
-  fseek(f, 0, SEEK_END);
-  int file_size = ftell(f);
-  if (file_size < 1) {
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return HTTP_ISSUE;
+  }
+  long file_size = ftell(f);
+  if (file_size < 0) {
+    fclose(f);
+    return HTTP_ISSUE;
+  }
+  if (file_size == 0) {
     ESP_LOGE(LOG_UPLOADER_TASK, "File %s is corrupt. Deleting it.", filename);
     fclose(f);
-    remove(filename);
     return FILE_HANDLED;
   }
   if (file_size >= LEGACY_LOG_SIZE_THRESHOLD) {
     ESP_LOGW(LOG_UPLOADER_TASK,
-             "%s is %d bytes — pre-aggregation legacy file, deleting (not uploaded)",
+             "%s is %ld bytes — pre-aggregation legacy file, deleting (not uploaded)",
              filename, file_size);
     fclose(f);
     return FILE_HANDLED;  // caller removes it and decrements the count
   }
-  fseek(f, 0, SEEK_SET);
+  if (fseek(f, 0, SEEK_SET) != 0) {
+    fclose(f);
+    return HTTP_ISSUE;
+  }
   char* buffer = pvPortMalloc(file_size);
   if (buffer == NULL) {
     ESP_LOGW(LOG_UPLOADER_TASK,
-             "out of heap allocating %d bytes for %s; will retry later",
+             "out of heap allocating %ld bytes for %s; will retry later",
              file_size, filename);
     fclose(f);
     return HTTP_ISSUE;
@@ -89,13 +101,18 @@ static log_uploader_event_t upload_file(char* filename) {
   fclose(f);
   if (n != (size_t)file_size) {
     ESP_LOGW(LOG_UPLOADER_TASK,
-             "short read on %s (got %zu of %d); will retry later",
+             "short read on %s (got %zu of %ld); will retry later",
              filename, n, file_size);
     vPortFree(buffer);
     return HTTP_ISSUE;
   }
 
   esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (client == NULL) {
+    ESP_LOGW(LOG_UPLOADER_TASK, "Failed to allocate HTTP client; will retry later");
+    vPortFree(buffer);
+    return HTTP_ISSUE;
+  }
   http_auth_headers(client);
   esp_http_client_set_post_field(client, buffer, file_size);
   esp_err_t err = esp_http_client_perform(client);
@@ -128,52 +145,52 @@ static log_uploader_event_t upload_file(char* filename) {
   }
 }
 
-void maybe_create_log_dir() {
+static bool maybe_create_log_dir(void) {
   DIR* dir = opendir(LOG_DIR);
   if (dir == NULL) {
     // create directory if it doesn't exist
     ESP_LOGI(LOG_UPLOADER_TASK, "Creating directory %s", LOG_DIR);
-    if (mkdir(LOG_DIR, 0777) != 0) {
+    if (mkdir(LOG_DIR, 0777) != 0 && errno != EEXIST) {
       ESP_LOGE(LOG_UPLOADER_TASK, "Failed to create directory");
-      vTaskDelete(NULL);
-      return;
+      return false;
     }
+    return true;
   }
   closedir(dir);
-}
-
-static void retry_upload(TimerHandle_t xTimer) {
-  xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eNoAction);
+  return true;
 }
 
 void log_uploader(void* params) {
-  TimerHandle_t retry_timer = NULL;
-  maybe_create_log_dir();
-
-  // initial value
-  log_files_to_upload = update_log_count();
-  if (log_files_to_upload > 0) {
-    xTaskNotify(xTaskGetHandle(LOG_UPLOADER_TASK), 0, eNoAction);
-  }
-  ESP_LOGI(LOG_UPLOADER_TASK, "Found %d logs", log_files_to_upload);
+  while (!maybe_create_log_dir()) vTaskDelay(pdMS_TO_TICKS(30000));
+  TickType_t wait_ticks = 0;
 
   while (1) {
-    uint32_t increment = 0;
-    xTaskNotifyWait(0, ULONG_MAX, &increment, portMAX_DELAY);
-    log_files_to_upload += increment;
+    xTaskNotifyWait(0, ULONG_MAX, NULL, wait_ticks);
+    wait_ticks = pdMS_TO_TICKS(30000);
+    int count = update_log_count();
+    if (count < 0) continue;
+    log_files_to_upload = count;
+    if (log_files_to_upload == 0) {
+      wait_ticks = portMAX_DELAY;
+      continue;
+    }
 
     // Upload is plain HTTPS; WiFi is its only precondition. (This also gated on
     // MQTT_CONNECTED as a proxy for mbedtls heap headroom — obsolete post-PSRAM,
     // and it silently deadlocked the backlog whenever MQTT failed to start.)
-    if (log_files_to_upload == 0 || !(xEventGroupGetBits(event_group) & WIFI_CONNECTED)) {
+    if (!(xEventGroupGetBits(event_group) & WIFI_CONNECTED)) {
       continue;
     }
 
     int error_count = 0;
     DIR* dir = opendir(LOG_DIR);
+    if (dir == NULL) {
+      ESP_LOGE(LOG_UPLOADER_TASK, "Failed to open directory; will retry later");
+      continue;
+    }
     struct dirent* entry;
     while ((entry = readdir(dir))) {
-      if (entry->d_type != DT_REG) {
+      if (entry->d_type != DT_REG || !log_has_suffix(entry->d_name, ".log")) {
         // skip non-regular files (e.g. directories)
         continue;
       }
@@ -210,25 +227,16 @@ void log_uploader(void* params) {
   end:
     closedir(dir);
 
-    if (log_files_to_upload > 0) {
-      log_files_to_upload = update_log_count();
-    }
-
-    if (log_files_to_upload > 0) {
-      // 30 s retry: transient upload failures clear within seconds, so a
-      // backlog of N files drains in about N×(upload_time+30 s) worst case.
-      // (Was 5 min, tuned against a boot-time mbedtls alloc race that no
-      // longer exists post-PSRAM; that made the worst case one file per 5 min.)
-      if (retry_timer == NULL) {
-        retry_timer =
-            xTimerCreate("retry_timer", pdMS_TO_TICKS(30000), pdFALSE, NULL, retry_upload);
-      }
+    count = update_log_count();
+    if (count >= 0) log_files_to_upload = count;
+    if (count == 0) {
+      wait_ticks = portMAX_DELAY;
+    } else {
       ESP_LOGI(
           LOG_UPLOADER_TASK,
           "Encountered %d errors while uploading. Scheduling retry in 30 s",
           error_count
       );
-      xTimerReset(retry_timer, 0);
     }
   }
 }

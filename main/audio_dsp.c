@@ -48,6 +48,8 @@ static const char* TAG = "audio_dsp";
 // would erase the speedup) isn't worth it — radix-2 SIMD stays.
 #define FFT_SIZE 4096
 #define FFT_HOP  2048     // 50% overlap
+#define DSP_WORK_QUEUE_LENGTH 8
+#define FFT_WINDOW_POOL_SIZE (DSP_WORK_QUEUE_LENGTH + 1)
 
 // --- dB SPL anchor ------------------------------------------------------------
 // The pipeline produces un-normalized FFT energy (no 1/N, no Hann-gain
@@ -111,10 +113,9 @@ static i2s_chan_handle_t i2s_rx;
 // are randomly or repeatedly indexed stay internal.
 //
 // raw_buffer: i2s_channel_read() destination, written every 21 ms — internal.
-// fft_ring:   written per sample (48k/s) at a wrapping head, read out of order
-//             (head_snapshot + i) & mask during windowing — internal.
 static int32_t  raw_buffer[I2S_BUFFER_FRAMES];     // raw 24-in-32-bit samples
 static float    fft_ring[FFT_SIZE];                // last FFT_SIZE float samples
+EXT_RAM_BSS_ATTR static float fft_windows[FFT_WINDOW_POOL_SIZE][FFT_SIZE];
 static int      fft_ring_head = 0;                 // next write index
 static int      samples_since_last_fft = 0;        // hop counter
 
@@ -174,11 +175,12 @@ typedef enum {
 
 typedef struct {
   dsp_work_type_t type;
-  int   fft_ring_head_snapshot;  // FFT: ring index at trigger time
+  int   fft_window_index;
   float peak_abs;                // EMIT: reader's snapshotted peak
 } dsp_work_t;
 
 static QueueHandle_t dsp_work_queue;
+static QueueHandle_t fft_free_windows_queue;
 
 // 30-min sliding LAeq/LCeq ring buffers (linear energies, not dB).
 // Same buffers serve the 5-minute window via compute_leq_recent(..., 300).
@@ -187,6 +189,8 @@ EXT_RAM_BSS_ATTR static float laeq_ring[RING_30M];
 EXT_RAM_BSS_ATTR static float lceq_ring[RING_30M];
 static int      ring_idx = 0;
 static int      total_seconds = 0;
+static audio_dsp_aggregates_t published_aggregates;
+static portMUX_TYPE aggregates_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // Pre-computed Hann window; saves ~9 ms/sec vs. calling cosf in the FFT inner
 // loop. In PSRAM: streamed once per FFT by the windowing loop.
@@ -476,18 +480,32 @@ static uint8_t encode_db_to_byte(float db) {
   return (uint8_t)(v + 0.5f);
 }
 
-// --- FFT execution: pulls FFT_SIZE samples from fft_ring (oldest-first) ----
-//
-// head_snapshot is the value of fft_ring_head at the moment the reader
-// posted WORK_FFT. The reader keeps writing fft_ring while the FFT
-// runs; as long as the FFT completes before the reader writes another
-// FFT_SIZE - FFT_HOP = 2048 samples (~43 ms at 48 kHz), the window
-// pointed at by head_snapshot is untouched. ANSI FFT on this S3 runs
-// well under that bound.
-static void run_fft_and_accumulate(int head_snapshot) {
+static void queue_fft_window(void) {
+  int window_index;
+  if (xQueueReceive(fft_free_windows_queue, &window_index, 0) != pdTRUE) {
+    ESP_LOGW(TAG, "FFT window pool exhausted, dropping FFT");
+    return;
+  }
+
+  size_t tail_samples = FFT_SIZE - fft_ring_head;
+  memcpy(fft_windows[window_index], fft_ring + fft_ring_head,
+         tail_samples * sizeof(float));
+  memcpy(fft_windows[window_index] + tail_samples, fft_ring,
+         fft_ring_head * sizeof(float));
+
+  dsp_work_t work = {
+    .type = DSP_WORK_FFT,
+    .fft_window_index = window_index,
+  };
+  if (xQueueSend(dsp_work_queue, &work, 0) != pdTRUE) {
+    xQueueSend(fft_free_windows_queue, &window_index, 0);
+    ESP_LOGW(TAG, "dsp_work_queue full, dropping FFT");
+  }
+}
+
+static void run_fft_and_accumulate(const float* samples) {
   for (int i = 0; i < FFT_SIZE; i++) {
-    int idx = (head_snapshot + i) & (FFT_SIZE - 1);
-    fft_work[2 * i]     = fft_ring[idx] * hann_window[i];
+    fft_work[2 * i]     = samples[i] * hann_window[i];
     fft_work[2 * i + 1] = 0.0f;
   }
 
@@ -580,18 +598,29 @@ static uint8_t leq_from_sum(double sum, int n) {
   return encode_db_to_byte(10.0f * log10f((float)(sum / (double)n)));
 }
 
-void audio_dsp_get_aggregates(audio_dsp_aggregates_t* out) {
+static void publish_aggregates(void) {
+  audio_dsp_aggregates_t next_aggregates;
   double a5, a30, c5, c30;
   leq_pair_sum(laeq_ring, ring_idx, &a5, &a30);
   leq_pair_sum(lceq_ring, ring_idx, &c5, &c30);
   int n5  = total_seconds < WINDOW_5M_SEC  ? total_seconds : WINDOW_5M_SEC;
   int n30 = total_seconds < WINDOW_30M_SEC ? total_seconds : WINDOW_30M_SEC;
-  out->laeq_5m  = leq_from_sum(a5,  n5);
-  out->lceq_5m  = leq_from_sum(c5,  n5);
-  out->laeq_30m = leq_from_sum(a30, n30);
-  out->lceq_30m = leq_from_sum(c30, n30);
-  out->has_5m   = (n5  >= WINDOW_5M_SEC);
-  out->has_30m  = (n30 >= WINDOW_30M_SEC);
+  next_aggregates.laeq_5m  = leq_from_sum(a5,  n5);
+  next_aggregates.lceq_5m  = leq_from_sum(c5,  n5);
+  next_aggregates.laeq_30m = leq_from_sum(a30, n30);
+  next_aggregates.lceq_30m = leq_from_sum(c30, n30);
+  next_aggregates.has_5m   = (n5  >= WINDOW_5M_SEC);
+  next_aggregates.has_30m  = (n30 >= WINDOW_30M_SEC);
+
+  taskENTER_CRITICAL(&aggregates_lock);
+  published_aggregates = next_aggregates;
+  taskEXIT_CRITICAL(&aggregates_lock);
+}
+
+void audio_dsp_get_aggregates(audio_dsp_aggregates_t* out) {
+  taskENTER_CRITICAL(&aggregates_lock);
+  *out = published_aggregates;
+  taskEXIT_CRITICAL(&aggregates_lock);
 }
 
 // --- Shared record → protobuf helpers ----------------------------------------
@@ -701,6 +730,7 @@ static void emit_per_second(float peak_abs) {
   lceq_ring[ring_idx] = lceq_lin;
   ring_idx = (ring_idx + 1) % RING_30M;
   if (total_seconds < RING_30M) total_seconds++;
+  publish_aggregates();
 
   if (time_set) {
     record_t r = { 0 };
@@ -792,13 +822,37 @@ static void fft_worker(void* params) {
     if (xQueueReceive(dsp_work_queue, &w, portMAX_DELAY) != pdTRUE) continue;
     switch (w.type) {
       case DSP_WORK_FFT:
-        run_fft_and_accumulate(w.fft_ring_head_snapshot);
+        run_fft_and_accumulate(fft_windows[w.fft_window_index]);
+        xQueueSend(fft_free_windows_queue, &w.fft_window_index, 0);
         break;
       case DSP_WORK_EMIT:
         emit_per_second(w.peak_abs);
         break;
     }
   }
+}
+
+static bool start_fft_worker(void) {
+  dsp_work_queue = xQueueCreate(DSP_WORK_QUEUE_LENGTH, sizeof(dsp_work_t));
+  fft_free_windows_queue = xQueueCreate(FFT_WINDOW_POOL_SIZE, sizeof(int));
+  if (!dsp_work_queue || !fft_free_windows_queue) {
+    ESP_LOGE(TAG, "failed to allocate DSP queues");
+  } else {
+    for (int window_index = 0; window_index < FFT_WINDOW_POOL_SIZE; window_index++) {
+      xQueueSend(fft_free_windows_queue, &window_index, 0);
+    }
+    if (xTaskCreatePinnedToCore(&fft_worker, "fft_worker", 6144, NULL,
+                               TASK_PRIO_NORMAL, NULL, 1) == pdPASS) {
+      return true;
+    }
+    ESP_LOGE(TAG, "failed to create FFT worker");
+  }
+
+  if (dsp_work_queue) vQueueDelete(dsp_work_queue);
+  if (fft_free_windows_queue) vQueueDelete(fft_free_windows_queue);
+  dsp_work_queue = NULL;
+  fft_free_windows_queue = NULL;
+  return false;
 }
 
 // --- Main task ---------------------------------------------------------------
@@ -814,14 +868,16 @@ void audio_dsp(void* params) {
   ESP_LOGI(TAG, "DSP initialized; sampling at %d Hz, %d-pt FFT", SAMPLE_RATE, FFT_SIZE);
   heap_diag("after dsp ready");
 
-  // Spawn the FFT worker. Same core as the reader (Core 1) but lower
-  // priority so the reader always preempts to service I²S — the worker
-  // gets the gaps. 8 deep covers ~340 ms of buffered work; if it fills
-  // the reader logs and drops a message rather than blocking I²S.
-  // 6 KB stack covers emit_per_second's printf + three xQueueSends with
-  // margin (record_writer hit 4 KB exactly).
-  dsp_work_queue = xQueueCreate(8, sizeof(dsp_work_t));
-  xTaskCreatePinnedToCore(&fft_worker, "fft_worker", 6144, NULL, TASK_PRIO_NORMAL, NULL, 1);
+  if (!start_fft_worker()) {
+#if !SIMULATE_MIC
+    i2s_channel_disable(i2s_rx);
+    i2s_del_channel(i2s_rx);
+    i2s_rx = NULL;
+#endif
+    dsps_fft2r_deinit_fc32();
+    vTaskDelete(NULL);
+    return;
+  }
 
   next_emit_us = esp_timer_get_time() + 1000000;
 
@@ -861,13 +917,7 @@ void audio_dsp(void* params) {
       // Hand the FFT off to the worker task every FFT_HOP samples.
       if (samples_since_last_fft >= FFT_HOP) {
         samples_since_last_fft = 0;
-        dsp_work_t w = {
-          .type = DSP_WORK_FFT,
-          .fft_ring_head_snapshot = fft_ring_head,
-        };
-        if (xQueueSend(dsp_work_queue, &w, 0) != pdTRUE) {
-          ESP_LOGW(TAG, "dsp_work_queue full, dropping FFT");
-        }
+        queue_fft_window();
       }
     }
 

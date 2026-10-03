@@ -50,8 +50,6 @@ typedef struct {
   bool    has_30m;
 } audio_dsp_aggregates_t;
 
-// Single-pass read of both 5m and 30m A/C-weighted Leqs from the shared
-// 30-min ring buffers.
 void audio_dsp_get_aggregates(audio_dsp_aggregates_t* out);
 
 // --- Shared record → protobuf helpers ----------------------------------------
